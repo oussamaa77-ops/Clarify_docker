@@ -2,6 +2,7 @@ import { createFileRoute, Outlet, Link, useNavigate, useLocation } from "@tansta
 import { useEffect } from "react";
 import { useAuth } from "@/hooks/useAuth";
 import { Button } from "@/components/ui/button";
+import { Receipt, Users2 } from "lucide-react";
 import {
   LayoutDashboard, FileText, Users, Building2, BookOpen, Landmark,
   FolderArchive, History, LogOut, Briefcase
@@ -34,6 +35,8 @@ function AppLayout() {
   { to: "/dossiers/$dossierId/clients", label: "Clients", icon: Users },
   { to: "/dossiers/$dossierId/fournisseurs", label: "Fournisseurs", icon: Building2 },
   { to: "/dossiers/$dossierId/comptabilite", label: "Comptabilité", icon: BookOpen },
+  { to: `/dossiers/${dossierId}/fiscalite`, label: "Fiscalité", icon: Receipt },
+  { to: `/dossiers/${dossierId}/paie`, label: "Paie & RH", icon: Users2 },
   { to: "/dossiers/$dossierId/banque", label: "Banque", icon: Landmark },
   { to: "/dossiers/$dossierId/ged", label: "GED", icon: FolderArchive },
   { to: "/dossiers/$dossierId/audit", label: "Audit", icon: History },

@@ -14,8 +14,10 @@ import { Route as AppRouteImport } from './routes/_app'
 import { Route as IndexRouteImport } from './routes/index'
 import { Route as AppDossiersRouteImport } from './routes/_app/dossiers'
 import { Route as AppDossiersDossierIdIndexRouteImport } from './routes/_app/dossiers.$dossierId.index'
+import { Route as AppDossiersDossierIdPaieRouteImport } from './routes/_app/dossiers.$dossierId.paie'
 import { Route as AppDossiersDossierIdGedRouteImport } from './routes/_app/dossiers.$dossierId.ged'
 import { Route as AppDossiersDossierIdFournisseursRouteImport } from './routes/_app/dossiers.$dossierId.fournisseurs'
+import { Route as AppDossiersDossierIdFiscaliteRouteImport } from './routes/_app/dossiers.$dossierId.fiscalite'
 import { Route as AppDossiersDossierIdFacturesRouteImport } from './routes/_app/dossiers.$dossierId.factures'
 import { Route as AppDossiersDossierIdDashboardRouteImport } from './routes/_app/dossiers.$dossierId.dashboard'
 import { Route as AppDossiersDossierIdComptabiliteRouteImport } from './routes/_app/dossiers.$dossierId.comptabilite'
@@ -48,6 +50,12 @@ const AppDossiersDossierIdIndexRoute =
     path: '/$dossierId/',
     getParentRoute: () => AppDossiersRoute,
   } as any)
+const AppDossiersDossierIdPaieRoute =
+  AppDossiersDossierIdPaieRouteImport.update({
+    id: '/$dossierId/paie',
+    path: '/$dossierId/paie',
+    getParentRoute: () => AppDossiersRoute,
+  } as any)
 const AppDossiersDossierIdGedRoute = AppDossiersDossierIdGedRouteImport.update({
   id: '/$dossierId/ged',
   path: '/$dossierId/ged',
@@ -57,6 +65,12 @@ const AppDossiersDossierIdFournisseursRoute =
   AppDossiersDossierIdFournisseursRouteImport.update({
     id: '/$dossierId/fournisseurs',
     path: '/$dossierId/fournisseurs',
+    getParentRoute: () => AppDossiersRoute,
+  } as any)
+const AppDossiersDossierIdFiscaliteRoute =
+  AppDossiersDossierIdFiscaliteRouteImport.update({
+    id: '/$dossierId/fiscalite',
+    path: '/$dossierId/fiscalite',
     getParentRoute: () => AppDossiersRoute,
   } as any)
 const AppDossiersDossierIdFacturesRoute =
@@ -106,8 +120,10 @@ export interface FileRoutesByFullPath {
   '/dossiers/$dossierId/comptabilite': typeof AppDossiersDossierIdComptabiliteRoute
   '/dossiers/$dossierId/dashboard': typeof AppDossiersDossierIdDashboardRoute
   '/dossiers/$dossierId/factures': typeof AppDossiersDossierIdFacturesRoute
+  '/dossiers/$dossierId/fiscalite': typeof AppDossiersDossierIdFiscaliteRoute
   '/dossiers/$dossierId/fournisseurs': typeof AppDossiersDossierIdFournisseursRoute
   '/dossiers/$dossierId/ged': typeof AppDossiersDossierIdGedRoute
+  '/dossiers/$dossierId/paie': typeof AppDossiersDossierIdPaieRoute
   '/dossiers/$dossierId/': typeof AppDossiersDossierIdIndexRoute
 }
 export interface FileRoutesByTo {
@@ -120,8 +136,10 @@ export interface FileRoutesByTo {
   '/dossiers/$dossierId/comptabilite': typeof AppDossiersDossierIdComptabiliteRoute
   '/dossiers/$dossierId/dashboard': typeof AppDossiersDossierIdDashboardRoute
   '/dossiers/$dossierId/factures': typeof AppDossiersDossierIdFacturesRoute
+  '/dossiers/$dossierId/fiscalite': typeof AppDossiersDossierIdFiscaliteRoute
   '/dossiers/$dossierId/fournisseurs': typeof AppDossiersDossierIdFournisseursRoute
   '/dossiers/$dossierId/ged': typeof AppDossiersDossierIdGedRoute
+  '/dossiers/$dossierId/paie': typeof AppDossiersDossierIdPaieRoute
   '/dossiers/$dossierId': typeof AppDossiersDossierIdIndexRoute
 }
 export interface FileRoutesById {
@@ -136,8 +154,10 @@ export interface FileRoutesById {
   '/_app/dossiers/$dossierId/comptabilite': typeof AppDossiersDossierIdComptabiliteRoute
   '/_app/dossiers/$dossierId/dashboard': typeof AppDossiersDossierIdDashboardRoute
   '/_app/dossiers/$dossierId/factures': typeof AppDossiersDossierIdFacturesRoute
+  '/_app/dossiers/$dossierId/fiscalite': typeof AppDossiersDossierIdFiscaliteRoute
   '/_app/dossiers/$dossierId/fournisseurs': typeof AppDossiersDossierIdFournisseursRoute
   '/_app/dossiers/$dossierId/ged': typeof AppDossiersDossierIdGedRoute
+  '/_app/dossiers/$dossierId/paie': typeof AppDossiersDossierIdPaieRoute
   '/_app/dossiers/$dossierId/': typeof AppDossiersDossierIdIndexRoute
 }
 export interface FileRouteTypes {
@@ -152,8 +172,10 @@ export interface FileRouteTypes {
     | '/dossiers/$dossierId/comptabilite'
     | '/dossiers/$dossierId/dashboard'
     | '/dossiers/$dossierId/factures'
+    | '/dossiers/$dossierId/fiscalite'
     | '/dossiers/$dossierId/fournisseurs'
     | '/dossiers/$dossierId/ged'
+    | '/dossiers/$dossierId/paie'
     | '/dossiers/$dossierId/'
   fileRoutesByTo: FileRoutesByTo
   to:
@@ -166,8 +188,10 @@ export interface FileRouteTypes {
     | '/dossiers/$dossierId/comptabilite'
     | '/dossiers/$dossierId/dashboard'
     | '/dossiers/$dossierId/factures'
+    | '/dossiers/$dossierId/fiscalite'
     | '/dossiers/$dossierId/fournisseurs'
     | '/dossiers/$dossierId/ged'
+    | '/dossiers/$dossierId/paie'
     | '/dossiers/$dossierId'
   id:
     | '__root__'
@@ -181,8 +205,10 @@ export interface FileRouteTypes {
     | '/_app/dossiers/$dossierId/comptabilite'
     | '/_app/dossiers/$dossierId/dashboard'
     | '/_app/dossiers/$dossierId/factures'
+    | '/_app/dossiers/$dossierId/fiscalite'
     | '/_app/dossiers/$dossierId/fournisseurs'
     | '/_app/dossiers/$dossierId/ged'
+    | '/_app/dossiers/$dossierId/paie'
     | '/_app/dossiers/$dossierId/'
   fileRoutesById: FileRoutesById
 }
@@ -229,6 +255,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AppDossiersDossierIdIndexRouteImport
       parentRoute: typeof AppDossiersRoute
     }
+    '/_app/dossiers/$dossierId/paie': {
+      id: '/_app/dossiers/$dossierId/paie'
+      path: '/$dossierId/paie'
+      fullPath: '/dossiers/$dossierId/paie'
+      preLoaderRoute: typeof AppDossiersDossierIdPaieRouteImport
+      parentRoute: typeof AppDossiersRoute
+    }
     '/_app/dossiers/$dossierId/ged': {
       id: '/_app/dossiers/$dossierId/ged'
       path: '/$dossierId/ged'
@@ -241,6 +274,13 @@ declare module '@tanstack/react-router' {
       path: '/$dossierId/fournisseurs'
       fullPath: '/dossiers/$dossierId/fournisseurs'
       preLoaderRoute: typeof AppDossiersDossierIdFournisseursRouteImport
+      parentRoute: typeof AppDossiersRoute
+    }
+    '/_app/dossiers/$dossierId/fiscalite': {
+      id: '/_app/dossiers/$dossierId/fiscalite'
+      path: '/$dossierId/fiscalite'
+      fullPath: '/dossiers/$dossierId/fiscalite'
+      preLoaderRoute: typeof AppDossiersDossierIdFiscaliteRouteImport
       parentRoute: typeof AppDossiersRoute
     }
     '/_app/dossiers/$dossierId/factures': {
@@ -295,8 +335,10 @@ interface AppDossiersRouteChildren {
   AppDossiersDossierIdComptabiliteRoute: typeof AppDossiersDossierIdComptabiliteRoute
   AppDossiersDossierIdDashboardRoute: typeof AppDossiersDossierIdDashboardRoute
   AppDossiersDossierIdFacturesRoute: typeof AppDossiersDossierIdFacturesRoute
+  AppDossiersDossierIdFiscaliteRoute: typeof AppDossiersDossierIdFiscaliteRoute
   AppDossiersDossierIdFournisseursRoute: typeof AppDossiersDossierIdFournisseursRoute
   AppDossiersDossierIdGedRoute: typeof AppDossiersDossierIdGedRoute
+  AppDossiersDossierIdPaieRoute: typeof AppDossiersDossierIdPaieRoute
   AppDossiersDossierIdIndexRoute: typeof AppDossiersDossierIdIndexRoute
 }
 
@@ -307,8 +349,10 @@ const AppDossiersRouteChildren: AppDossiersRouteChildren = {
   AppDossiersDossierIdComptabiliteRoute: AppDossiersDossierIdComptabiliteRoute,
   AppDossiersDossierIdDashboardRoute: AppDossiersDossierIdDashboardRoute,
   AppDossiersDossierIdFacturesRoute: AppDossiersDossierIdFacturesRoute,
+  AppDossiersDossierIdFiscaliteRoute: AppDossiersDossierIdFiscaliteRoute,
   AppDossiersDossierIdFournisseursRoute: AppDossiersDossierIdFournisseursRoute,
   AppDossiersDossierIdGedRoute: AppDossiersDossierIdGedRoute,
+  AppDossiersDossierIdPaieRoute: AppDossiersDossierIdPaieRoute,
   AppDossiersDossierIdIndexRoute: AppDossiersDossierIdIndexRoute,
 }
 
