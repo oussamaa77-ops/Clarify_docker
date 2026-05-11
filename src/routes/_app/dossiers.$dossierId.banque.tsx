@@ -136,74 +136,162 @@ function BanquePage() {
   };
 
   // Parser relevé bancaire (regex universel multi-banques)
-  const parseReleveText = (text: string): any[] => {
-    const lines = text.split(/\n/).map(l => l.trim()).filter(l => l.length > 5);
-    const transactions: any[] = [];
+  const parseReleveText = (rawText: string): any[] => {
 
-    // Pattern universel : date + libellé + montant
-    const datePatterns = [
-      /(\d{2}[\/\-]\d{2}[\/\-]\d{2,4})/,
-      /(\d{4}[\/\-]\d{2}[\/\-]\d{2})/,
-    ];
-    const amountPattern = /(\d[\d\s]*[,.]?\d{0,2})\s*(?:MAD|DH)?/g;
+  // ── Mots-clés à exclure (en-têtes, pieds de page) ────────────────────────
+  const EXCL = [
+    'solde depart','solde reporte','ancien solde',
+    'nouveau solde','total des mouvements','sauf erreur',
+    'releve de compte','releve d\'identite','banque ville',
+    'devise','nous avons l\'honneur','votre conseiller',
+    'agence ','n° tel','n° tél','operation-reference',
+    'oper valeur','dates','mediateur','centre relation',
+    'c.i.h','www.','sa au capital','rc:','cnss:','if:',
+    'patente:','ice:','tel. :','tél. :','email :',
+    'banque populaire','attijariwafa','bmce','bmci',
+    'page n°','page n',
+  ];
 
-    for (const line of lines) {
-      let dateMatch = null;
-      for (const dp of datePatterns) {
-        dateMatch = line.match(dp);
-        if (dateMatch) break;
+  const isExcluded = (line: string): boolean => {
+    const low = line.toLowerCase();
+    return EXCL.some(k => low.includes(k));
+  };
+
+  // ── Patterns de dates ─────────────────────────────────────────────────────
+  // CIH format réel : "01/020 1/02" (chiffre parasite après mois)
+  const CIH_REAL = /^(\d{2})\/(\d{2})\d?\s+\d?\s*\d{0,2}\/\d{2}/;
+  // CIH format normal : "01/02 01/02"
+  const CIH_NORM = /^(\d{2})[\/\-](\d{2})\s+\d{2}[\/\-]\d{2}/;
+  // BP format : "02 02 2026 02 02 2026"
+  const BP_DATE  = /^(\d{2})\s+(\d{2})\s+(\d{4})\s+/;
+
+  const hasDate = (line: string): boolean =>
+    CIH_REAL.test(line) || CIH_NORM.test(line) || BP_DATE.test(line);
+
+  // ── Extraction de montants ────────────────────────────────────────────────
+  function extractAmounts(line: string): number[] {
+    const found: number[] = [];
+
+    // PRIORITÉ 1 : montants avec séparateur espace "1 300,00", "10 800,00"
+    const withSpace = [...line.matchAll(/\b(\d{1,3}(?: \d{3})+),(\d{2})\b/g)];
+    if (withSpace.length) {
+      for (const m of withSpace) {
+        const val = parseFloat(m[1].replace(/ /g, '') + '.' + m[3]);
+        if (!isNaN(val) && val > 0 && val < 100_000_000) found.push(val);
       }
-      if (!dateMatch) continue;
-
-      const amounts = [...line.matchAll(amountPattern)]
-        .map(m => parseFloat(m[1].replace(/\s/g, "").replace(",", ".")))
-        .filter(n => !isNaN(n) && n > 0 && n < 10_000_000);
-
-      if (!amounts.length) continue;
-
-      const montant = amounts[amounts.length - 1];
-      const libelle = line.replace(datePatterns[0], "").replace(/\d[\d\s,.]*/g, "").trim().slice(0, 100);
-
-      // Détecter type (débit/crédit) via mots-clés
-      const lineUpper = line.toUpperCase();
-      const isCredit = lineUpper.includes("CREDIT") || lineUpper.includes("VIREMENT RECU") ||
-        lineUpper.includes("REMISE") || lineUpper.includes("ENCAISSEMENT");
-      const isDebit = lineUpper.includes("DEBIT") || lineUpper.includes("PRELEVEMENT") ||
-        lineUpper.includes("PAIEMENT") || lineUpper.includes("CHEQUE") ||
-        lineUpper.includes("CNSS") || lineUpper.includes("TVA") || lineUpper.includes("SALAIRE");
-
-      // Catégoriser
-      let categorie = "autre";
-      if (lineUpper.includes("SALAIRE") || lineUpper.includes("PAIE")) categorie = "salaires";
-      else if (lineUpper.includes("CNSS") || lineUpper.includes("AMO")) categorie = "cotisations_sociales";
-      else if (lineUpper.includes("TVA") || lineUpper.includes("DGI") || lineUpper.includes("IMPOT")) categorie = "impots_taxes";
-      else if (lineUpper.includes("LOYER") || lineUpper.includes("LOCATION")) categorie = "loyers";
-      else if (lineUpper.includes("VIREMENT") || lineUpper.includes("FACTURE")) categorie = "paiement_facture";
-      else if (isCredit) categorie = "encaissement";
-      else if (isDebit) categorie = "depense";
-
-      // Date parsing
-      let date = dateMatch[1];
-      const parts = date.split(/[\/\-]/);
-      if (parts[0].length === 4) date = date.replace(/\//g, "-");
-      else if (parts.length === 3) {
-        const [dd, mm, yyyy] = parts;
-        date = `${yyyy.length === 2 ? "20" + yyyy : yyyy}-${mm.padStart(2, "0")}-${dd.padStart(2, "0")}`;
-      }
-
-      transactions.push({
-        date_operation: date,
-        libelle: libelle || "Transaction",
-        type: isCredit ? "credit" : "debit",
-        montant,
-        categorie,
-        compte_comptable: mapCategorieToCompte(categorie, isCredit),
-        rapproche: false,
-      });
+      return found;
     }
 
-    return transactions.filter(t => t.montant > 0).slice(0, 200);
-  };
+    // PRIORITÉ 2 : montants simples "10800,00", "90,00" (2 à 7 chiffres)
+    for (const m of line.matchAll(/(?<![,\d])(\d{2,7}),(\d{2})(?!\d)/g)) {
+      const val = parseFloat(m[1] + '.' + m[2]);
+      if (!isNaN(val) && val > 0 && val < 10_000_000) found.push(val);
+    }
+
+    return found;
+  }
+
+  // ── Extraction de date ────────────────────────────────────────────────────
+  const year = new Date().getFullYear();
+  function extractDate(line: string): string | null {
+    // BP : DD MM YYYY
+    const bp = line.match(/^(\d{2})\s+(\d{2})\s+(\d{4})/);
+    if (bp) return `${bp[3]}-${bp[2]}-${bp[1]}`;
+    // CIH : DD/MM (potentiellement avec chiffre parasite)
+    const cih = line.match(/^(\d{2})\/(\d{2})/);
+    if (cih) return `${year}-${cih[2].padStart(2,'0')}-${cih[1].padStart(2,'0')}`;
+    return null;
+  }
+
+  // ── Détecter crédit/débit ─────────────────────────────────────────────────
+  function detectType(text: string): 'credit' | 'debit' {
+    const up = text.toUpperCase();
+    if (
+      up.includes('VIR SEPA RECU') || up.includes('VIR. RECU') ||
+      up.includes('VIRT RECU') || up.includes('VIREMENT RECU') ||
+      up.includes('RECU DE') || up.includes('RECU /') ||
+      up.includes('INTERETS CREDIT') || up.includes('INTERETS CREDITEURS') ||
+      up.includes('REMISE CHEQUE') || up.includes('ENCAISSEMENT') ||
+      up.includes('REMISE ESP')
+    ) return 'credit';
+    return 'debit';
+  }
+
+  // ── Catégoriser pour PCM ──────────────────────────────────────────────────
+  function categorize(text: string, type: 'credit' | 'debit'): { cat: string; compte: string } {
+    const up = text.toUpperCase();
+    if (up.includes('SALAIRE') || up.includes('PAIE')) return { cat: 'salaires', compte: '6171' };
+    if (up.includes('CNSS') || up.includes('AMO'))     return { cat: 'cotisations_sociales', compte: '6174' };
+    if (up.includes('TVA') || up.includes('DGI') || up.includes('IMPOT')) return { cat: 'impots_taxes', compte: '4456' };
+    if (up.includes('LOYER'))                           return { cat: 'loyers', compte: '6131' };
+    if (up.includes('COMMISSION') || up.includes('FRAIS') || up.includes('TENUE DE COMPTE')) return { cat: 'frais_bancaires', compte: '6141' };
+    if (type === 'credit')                              return { cat: 'encaissement', compte: '3421' };
+    if (up.includes('VIREMENT EMIS') || up.includes('VIR. EMIS') || up.includes('VIR. BP DIGITAL')) return { cat: 'paiement_fournisseur', compte: '4411' };
+    return { cat: 'autre', compte: type === 'debit' ? '6141' : '7111' };
+  }
+
+  // ── ÉTAPE 1 : fusionner les lignes orphelines ─────────────────────────────
+  const lines = rawText.split('\n').map((l: string) => l.trim()).filter((l: string) => l.length > 1);
+  const anchored: string[] = [];
+
+  for (const line of lines) {
+    if (!line) continue;
+    // Ignorer lignes arabes pures
+    if (/^[\u0600-\u06FF\s,\.]+$/.test(line)) continue;
+    if (isExcluded(line)) continue;
+
+    if (hasDate(line)) {
+      anchored.push(line);
+    } else if (anchored.length > 0) {
+      // Chiffre isolé ou ",xx" = suite d'un montant découpé → coller sans espace
+      if (/^[\d]+$/.test(line) || /^,\d+/.test(line)) {
+        anchored[anchored.length - 1] += line;
+      } else {
+        anchored[anchored.length - 1] += ' ' + line;
+      }
+    }
+  }
+
+  // ── ÉTAPE 2 : parser chaque ligne ────────────────────────────────────────
+  const transactions: any[] = [];
+
+  for (const line of anchored) {
+    // Réparer les montants découpés "10800,0 0" → "10800,00"
+    const fixed = line.replace(/(\d+,\d)\s+(\d)\b/g, '$1$2');
+
+    const amounts = extractAmounts(fixed);
+    if (!amounts.length) continue;
+
+    const montant = amounts[amounts.length - 1];
+    const date = extractDate(fixed);
+    if (!date) continue;
+
+    // Libellé : supprimer la date et les montants
+    let libelle = fixed
+      .replace(/^\d{2}\/\d{2}\d?\s+\d?\s*\d{0,2}\/\d{2}\s+/, '')
+      .replace(/^\d{2}\s+\d{2}\s+\d{4}\s+\d{2}\s+\d{2}\s+\d{4}\s+/, '')
+      .replace(/\b\d{1,3}(?: \d{3})+,\d{2}\b/g, '')
+      .replace(/(?<![,\d])\d{2,7},\d{2}(?!\d)/g, '')
+      .replace(/\s{2,}/g, ' ')
+      .trim()
+      .slice(0, 100);
+
+    const type = detectType(fixed);
+    const { cat, compte } = categorize(fixed, type);
+
+    transactions.push({
+      date_operation: date,
+      libelle: libelle || 'Transaction',
+      type,
+      montant,
+      categorie: cat,
+      compte_comptable: compte,
+      rapproche: false,
+    });
+  }
+
+  return transactions.filter((t: any) => t.montant > 0);
+};
 
   const mapCategorieToCompte = (cat: string, isCredit: boolean): string => {
     const map: Record<string, string> = {
@@ -309,35 +397,72 @@ function BanquePage() {
 
   // ── Rapprochement automatique factures/relevé ─────────────────────────────
   const rapprochementAuto = async (txList: any[]) => {
-    for (const tx of txList) {
-      if (tx.type === "credit") {
-        // Chercher facture client dont le montant correspond
-        const facture = facturesNonPayees.find(f =>
-          f.type === "client" && Math.abs(f.montant_ttc - tx.montant) < 0.01
+  for (const tx of txList) {
+    const libUpper = (tx.libelle ?? "").toUpperCase();
+
+    if (tx.type === "credit") {
+      // PRIORITÉ 1 : correspondance par numéro de facture dans le libellé
+      let facture = facturesNonPayees.find(f =>
+        f.type === "client" &&
+        f.numero &&
+        libUpper.includes(f.numero.toUpperCase())
+      );
+
+      // PRIORITÉ 2 : correspondance par montant exact (si pas trouvé par numéro)
+      if (!facture) {
+        facture = facturesNonPayees.find(f =>
+          f.type === "client" &&
+          Math.abs(f.montant_ttc - tx.montant) < 0.01
         );
-        if (facture) {
-          await supabase.from("factures").update({ statut_paiement: "payee", date_paiement: tx.date_operation }).eq("id", facture.id);
-          // Remplacer créance client par encaissement banque
-          await supabase.from("ecritures_comptables").insert([
-            { dossier_id: dossierId, journal_code: "BQ", compte_numero: "3421", date_ecriture: tx.date_operation, libelle: `Règlement ${facture.nom} ${facture.numero ?? ""}`, debit: 0, credit: tx.montant, reference_piece: facture.numero ?? "", valide: true },
-          ]);
-          console.log("[Rapprochement] Facture client payée automatiquement:", facture.numero);
-        }
-      } else {
-        // Chercher facture fournisseur
-        const facture = facturesNonPayees.find(f =>
-          f.type === "fournisseur" && Math.abs(f.montant_ttc - tx.montant) < 0.01
+      }
+
+      if (facture) {
+        await supabase.from("factures")
+          .update({ statut_paiement: "payee", date_paiement: tx.date_operation })
+          .eq("id", facture.id);
+        await supabase.from("ecritures_comptables").insert([{
+          dossier_id: dossierId, journal_code: "BQ",
+          compte_numero: "3421",
+          date_ecriture: tx.date_operation,
+          libelle: `Règlement ${facture.nom} ${facture.numero ?? ""}`,
+          debit: 0, credit: tx.montant,
+          reference_piece: facture.numero ?? "", valide: true,
+        }]);
+        console.log(`[Rapprochement] ✅ ${facture.numero} — ${facture.nom} — ${tx.montant} MAD`);
+      }
+
+    } else {
+      // Fournisseurs — même logique
+      let facture = facturesNonPayees.find(f =>
+        f.type === "fournisseur" &&
+        f.numero &&
+        libUpper.includes(f.numero.toUpperCase())
+      );
+
+      if (!facture) {
+        facture = facturesNonPayees.find(f =>
+          f.type === "fournisseur" &&
+          Math.abs(f.montant_ttc - tx.montant) < 0.01
         );
-        if (facture) {
-          await supabase.from("factures_fournisseurs").update({ statut_paiement: "payee", date_paiement: tx.date_operation } as any).eq("id", facture.id);
-          await supabase.from("ecritures_comptables").insert([
-            { dossier_id: dossierId, journal_code: "BQ", compte_numero: "4411", date_ecriture: tx.date_operation, libelle: `Paiement ${facture.nom}`, debit: tx.montant, credit: 0, reference_piece: facture.numero ?? "", valide: true },
-          ]);
-          console.log("[Rapprochement] Facture fournisseur payée automatiquement:", facture.numero);
-        }
+      }
+
+      if (facture) {
+        await supabase.from("factures_fournisseurs")
+          .update({ statut_paiement: "payee", date_paiement: tx.date_operation } as any)
+          .eq("id", facture.id);
+        await supabase.from("ecritures_comptables").insert([{
+          dossier_id: dossierId, journal_code: "BQ",
+          compte_numero: "4411",
+          date_ecriture: tx.date_operation,
+          libelle: `Paiement ${facture.nom}`,
+          debit: tx.montant, credit: 0,
+          reference_piece: facture.numero ?? "", valide: true,
+        }]);
+        console.log(`[Rapprochement] ✅ ${facture.numero} — ${facture.nom} — ${tx.montant} MAD`);
       }
     }
-  };
+  }
+};
 
   // ── Enregistrer encaissement espèces/chèque ───────────────────────────────
   const handleEncaissement = async () => {
