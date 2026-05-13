@@ -12,7 +12,7 @@ import { toast } from "sonner";
 import { createServerFn } from "@tanstack/react-start";
 import { z } from "zod";
 
-export const Route = createFileRoute("/_app/dossiers/$dossierId/banque/scanner")({
+export const Route = createFileRoute("/_app/dossiers/$dossierId/relevescanner")({
   component: RelEveScanner,
 });
 
@@ -65,17 +65,17 @@ interface InfoReleve {
 const NATURES_OPERATION = [
   { value: "encaissement_client",    label: "Encaissement client",       code: "3421", tva: false },
   { value: "paiement_fournisseur",   label: "Paiement fournisseur",      code: "4411", tva: true  },
-  { value: "salaires",               label: "Paiement salaires",         code: "6171", tva: false },
+  { value: "salaires",               label: "Paiement salaires",         code: "4432", tva: false },
   { value: "cnss_amo",               label: "CNSS / AMO",                code: "6174", tva: false },
   { value: "tva_dgi",                label: "TVA / Impôts DGI",          code: "4456", tva: false },
-  { value: "loyers",                 label: "Loyer / Location",          code: "6131", tva: true  },
-  { value: "eau_electricite",        label: "Eau / Électricité ONEE",    code: "6125", tva: true  },
-  { value: "telecom",                label: "Téléphone / Internet",      code: "6132", tva: true  },
+  { value: "loyers",                 label: "Loyer / Location",          code: "6131", tva: false  },
+  { value: "eau_electricite",        label: "Eau / Électricité ONEE",    code: "61251", tva: true  },
+  { value: "telecom",                label: "Téléphone / Internet",      code: "6145", tva: true  },
   { value: "gasoil",                 label: "Gasoil / Carburant",        code: "6122", tva: true  },
   { value: "assurance",              label: "Assurance",                 code: "6161", tva: false },
-  { value: "entretien",              label: "Entretien / Réparation",    code: "6141", tva: true  },
-  { value: "fournitures_bureau",     label: "Fournitures bureau",        code: "6132", tva: true  },
-  { value: "frais_bancaires",        label: "Frais bancaires",           code: "6347", tva: false },
+  { value: "entretien",              label: "Entretien / Réparation",    code: "6133", tva: true  },
+  { value: "fournitures_bureau",     label: "Fournitures bureau",        code: "61227", tva: true  },
+  { value: "frais_bancaires",        label: "Frais bancaires",           code: "6147", tva: true },
   { value: "taxe_professionnelle",   label: "Taxe Professionnelle",      code: "6313", tva: false },
   { value: "retrait_especes",        label: "Retrait espèces / GAB",     code: "5161", tva: false },
   { value: "interets_crediteurs",    label: "Intérêts créditeurs",       code: "7611", tva: false },
@@ -98,16 +98,17 @@ export const analyserTransactions = createServerFn({ method: "POST" })
     const GROQ_KEY = process.env.GROQ_API_KEY;
     if (!GROQ_KEY) throw new Error("GROQ_API_KEY manquante");
 
-    const prompt = `Tu es expert-comptable marocain certifié. Analyse ces transactions bancaires et catégorise-les selon le Plan Comptable Marocain (PCM CGNC).
+    const prompt = `Tu es un Expert-Comptable Marocain certifié et un auditeur fiscal spécialisé dans le Plan Comptable Marocain (PCM / CGNC). Ton rôle est d'analyser des transactions bancaires, de les catégoriser, et de détecter toute anomalie fiscale ou comptable.
 
-DONNÉES DISPONIBLES:
-Factures clients non payées: ${JSON.stringify(data.factures_client.map((f: any) => ({ num: f.numero, client: f.clients?.nom, ttc: f.montant_ttc, ht: f.montant_ht, tva: f.montant_tva })))}
-Factures fournisseurs non payées: ${JSON.stringify(data.factures_fourn.map((f: any) => ({ num: f.numero, fourn: f.fournisseur_nom, ttc: f.montant_ttc, ht: f.montant_ht, tva: f.montant_tva })))}
-Fournisseurs connus: ${JSON.stringify(data.fournisseurs.map((f: any) => ({ nom: f.nom, ice: f.ice })))}
-Clients connus: ${JSON.stringify(data.clients.map((c: any) => ({ nom: c.nom, ice: c.ice })))}
-${data.remarques ? `Remarques comptable: ${data.remarques}` : ""}
+---
+DONNÉES DE RÉFÉRENCE:
+1. Factures clients (TVA en attente/encaissement): ${JSON.stringify(data.factures_client.map((f: any) => ({ num: f.numero, client: f.clients?.nom, ttc: f.montant_ttc, ht: f.montant_ht, tva: f.montant_tva, date: f.date })))}
+2. Factures fournisseurs (à payer): ${JSON.stringify(data.factures_fourn.map((f: any) => ({ num: f.numero, fourn: f.fournisseur_nom, ttc: f.montant_ttc, ht: f.montant_ht, tva: f.montant_tva, date: f.date })))}
+3. Référentiel Tiers: ${JSON.stringify([...data.fournisseurs, ...data.clients].map((t: any) => ({ nom: t.nom, ice: t.ice })))}
+${data.remarques ? `Notes spécifiques du dossier: ${data.remarques}` : ""}
 
-TRANSACTIONS À ANALYSER:
+---
+TRANSACTIONS BANCAIRES À AUDITER:
 ${JSON.stringify(data.transactions_brutes.map((tx: any) => ({
   ligne: tx.ligne,
   date: tx.date_operation,
@@ -116,46 +117,44 @@ ${JSON.stringify(data.transactions_brutes.map((tx: any) => ({
   credit: tx.montant_credit,
 })))}
 
-Pour CHAQUE transaction, détermine:
-- nature_principale: une valeur parmi [encaissement_client, paiement_fournisseur, salaires, cnss_amo, tva_dgi, loyers, eau_electricite, telecom, gasoil, assurance, entretien, fournitures_bureau, frais_bancaires, taxe_professionnelle, retrait_especes, interets_crediteurs, virement_interne, autre]
-- code_pcm: compte PCM 4 chiffres (ex: 3421, 4411, 6171...)
-- tiers_nom: nom du client/fournisseur/organisme (si identifié)
-- tiers_type: client|fournisseur|employe|etat|banque|autre
-- facture_num: numéro de facture associée (null si non trouvé)
-- montant_ht: HT calculé (null si pas de TVA)
-- montant_tva: TVA calculée (null si pas de TVA)
-- taux_tva: 0, 7, 10, 14, ou 20
-- confiance: 0-100
-- alerte: message si problème (null sinon)
-- suggestions: 2-3 alternatives possibles avec {nature, code_pcm, tiers, confiance}
+---
+INSTRUCTIONS DE CLASSIFICATION ET D'AUDIT:
 
-RÈGLES PCM MAROC:
-- Paiement fournisseur avec facture → 6141 charge + 34552 TVA récup + 4411 fourn + 5141 banque
-- Encaissement client → 5141 débit + 3421 crédit
-- Salaires → 6171 débit + 4441 crédit
-- CNSS/AMO → 6174 débit + 4441 crédit  
-- TVA DGI → 4456 débit + 5141 crédit
-- Loyer (TVA 10%) → 6131 + 34552 + 4411
-- Gasoil (TVA 20%) → 6122 + 34552 + 4411
-- Télécom (TVA 20%) → 6132 + 34552 + 4411
-- Eau/Elec (TVA 14%) → 6125 + 34552 + 4411
+1. ANALYSE DE LA TVA (RÈGLES MAROC):
+- Loyers (6131): TVA 20% (si assujetti). [cite: 15]
+- Électricité (61251): TVA 14%. [cite: 1]
+- Eau (61251): TVA 7%. [cite: 1]
+- Télécom / Internet (6145): TVA 20%. [cite: 15]
+- Frais Bancaires (6147): TVA 10% (obligatoire). [cite: 15]
+- Gasoil (61222): TVA 10% (Récupérable uniquement si éligible). [cite: 15]
+- Transports (6142): TVA 14%. [cite: 15]
 
-Réponds UNIQUEMENT avec JSON valide:
+2. RÈGLES DE MATCHING (AUDIT NIVEAU 3):
+- Pour chaque encaissement (CRÉDIT), cherche une correspondance avec "Factures clients".
+- Si le montant TTC de la facture != montant encaissé, calcule l'écart et signale un "Paiement partiel" ou "Écart de règlement" dans 'alerte'.
+- Vérifie si le libellé bancaire contient des mots-clés des "Référentiels Tiers".
+
+3. DÉTECTION D'ANOMALIES:
+- Alerte si une transaction de type 'frais_bancaires' n'a pas de TVA calculée à 10%.
+- Alerte si un virement tiers est identifié mais qu'aucune facture n'existe dans les données de référence.
+
+---
+FORMAT DE RÉPONSE (JSON UNIQUEMENT):
 {
   "analyses": [
     {
       "ligne": number,
-      "nature_principale": "string",
-      "code_pcm": "string",
+      "nature_principale": "encaissement_client|paiement_fournisseur|salaires|cnss_amo|tva_dgi|loyers|eau_electricite|telecom|gasoil|assurance|entretien|fournitures_bureau|frais_bancaires|taxe_professionnelle|retrait_especes|interets_crediteurs|virement_interne|autre",
+      "code_pcm": "string (4 chiffres)",
       "tiers_nom": "string|null",
-      "tiers_type": "string",
+      "tiers_type": "client|fournisseur|employe|etat|banque|autre",
       "facture_num": "string|null",
       "montant_ht": number|null,
       "montant_tva": number|null,
-      "taux_tva": number,
-      "confiance": number,
-      "alerte": "string|null",
-      "suggestions": [{"nature":"string","code_pcm":"string","tiers":"string","confiance":number}]
+      "taux_tva": 0|7|10|14|20,
+      "confiance": number (0-100),
+      "alerte": "string|null (Ex: 'Écart de 200 DH avec facture', 'TVA 10% non appliquée')",
+      "suggestions": [{"nature":"string", "code_pcm":"string", "confiance":number}]
     }
   ]
 }`;
