@@ -40,6 +40,7 @@ function AppLayout() {
   { to: "/dossiers/$dossierId/banque", label: "Banque", icon: Landmark },
   { to: "/dossiers/$dossierId/ged", label: "GED", icon: FolderArchive },
   { to: "/dossiers/$dossierId/audit", label: "Audit", icon: History },
+  { to: `/dossiers/${dossierId}/relevescanner`, label: "Scanner relevé", icon: ScanLine },
 ] : [];
 
   return (
