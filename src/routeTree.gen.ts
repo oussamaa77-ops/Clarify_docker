@@ -14,6 +14,7 @@ import { Route as AppRouteImport } from './routes/_app'
 import { Route as IndexRouteImport } from './routes/index'
 import { Route as AppDossiersRouteImport } from './routes/_app/dossiers'
 import { Route as AppDossiersDossierIdIndexRouteImport } from './routes/_app/dossiers.$dossierId.index'
+import { Route as AppDossiersDossierIdRelevescannerRouteImport } from './routes/_app/dossiers.$dossierId.relevescanner'
 import { Route as AppDossiersDossierIdPaieRouteImport } from './routes/_app/dossiers.$dossierId.paie'
 import { Route as AppDossiersDossierIdGedRouteImport } from './routes/_app/dossiers.$dossierId.ged'
 import { Route as AppDossiersDossierIdFournisseursRouteImport } from './routes/_app/dossiers.$dossierId.fournisseurs'
@@ -48,6 +49,12 @@ const AppDossiersDossierIdIndexRoute =
   AppDossiersDossierIdIndexRouteImport.update({
     id: '/$dossierId/',
     path: '/$dossierId/',
+    getParentRoute: () => AppDossiersRoute,
+  } as any)
+const AppDossiersDossierIdRelevescannerRoute =
+  AppDossiersDossierIdRelevescannerRouteImport.update({
+    id: '/$dossierId/relevescanner',
+    path: '/$dossierId/relevescanner',
     getParentRoute: () => AppDossiersRoute,
   } as any)
 const AppDossiersDossierIdPaieRoute =
@@ -124,6 +131,7 @@ export interface FileRoutesByFullPath {
   '/dossiers/$dossierId/fournisseurs': typeof AppDossiersDossierIdFournisseursRoute
   '/dossiers/$dossierId/ged': typeof AppDossiersDossierIdGedRoute
   '/dossiers/$dossierId/paie': typeof AppDossiersDossierIdPaieRoute
+  '/dossiers/$dossierId/relevescanner': typeof AppDossiersDossierIdRelevescannerRoute
   '/dossiers/$dossierId/': typeof AppDossiersDossierIdIndexRoute
 }
 export interface FileRoutesByTo {
@@ -140,6 +148,7 @@ export interface FileRoutesByTo {
   '/dossiers/$dossierId/fournisseurs': typeof AppDossiersDossierIdFournisseursRoute
   '/dossiers/$dossierId/ged': typeof AppDossiersDossierIdGedRoute
   '/dossiers/$dossierId/paie': typeof AppDossiersDossierIdPaieRoute
+  '/dossiers/$dossierId/relevescanner': typeof AppDossiersDossierIdRelevescannerRoute
   '/dossiers/$dossierId': typeof AppDossiersDossierIdIndexRoute
 }
 export interface FileRoutesById {
@@ -158,6 +167,7 @@ export interface FileRoutesById {
   '/_app/dossiers/$dossierId/fournisseurs': typeof AppDossiersDossierIdFournisseursRoute
   '/_app/dossiers/$dossierId/ged': typeof AppDossiersDossierIdGedRoute
   '/_app/dossiers/$dossierId/paie': typeof AppDossiersDossierIdPaieRoute
+  '/_app/dossiers/$dossierId/relevescanner': typeof AppDossiersDossierIdRelevescannerRoute
   '/_app/dossiers/$dossierId/': typeof AppDossiersDossierIdIndexRoute
 }
 export interface FileRouteTypes {
@@ -176,6 +186,7 @@ export interface FileRouteTypes {
     | '/dossiers/$dossierId/fournisseurs'
     | '/dossiers/$dossierId/ged'
     | '/dossiers/$dossierId/paie'
+    | '/dossiers/$dossierId/relevescanner'
     | '/dossiers/$dossierId/'
   fileRoutesByTo: FileRoutesByTo
   to:
@@ -192,6 +203,7 @@ export interface FileRouteTypes {
     | '/dossiers/$dossierId/fournisseurs'
     | '/dossiers/$dossierId/ged'
     | '/dossiers/$dossierId/paie'
+    | '/dossiers/$dossierId/relevescanner'
     | '/dossiers/$dossierId'
   id:
     | '__root__'
@@ -209,6 +221,7 @@ export interface FileRouteTypes {
     | '/_app/dossiers/$dossierId/fournisseurs'
     | '/_app/dossiers/$dossierId/ged'
     | '/_app/dossiers/$dossierId/paie'
+    | '/_app/dossiers/$dossierId/relevescanner'
     | '/_app/dossiers/$dossierId/'
   fileRoutesById: FileRoutesById
 }
@@ -253,6 +266,13 @@ declare module '@tanstack/react-router' {
       path: '/$dossierId'
       fullPath: '/dossiers/$dossierId/'
       preLoaderRoute: typeof AppDossiersDossierIdIndexRouteImport
+      parentRoute: typeof AppDossiersRoute
+    }
+    '/_app/dossiers/$dossierId/relevescanner': {
+      id: '/_app/dossiers/$dossierId/relevescanner'
+      path: '/$dossierId/relevescanner'
+      fullPath: '/dossiers/$dossierId/relevescanner'
+      preLoaderRoute: typeof AppDossiersDossierIdRelevescannerRouteImport
       parentRoute: typeof AppDossiersRoute
     }
     '/_app/dossiers/$dossierId/paie': {
@@ -339,6 +359,7 @@ interface AppDossiersRouteChildren {
   AppDossiersDossierIdFournisseursRoute: typeof AppDossiersDossierIdFournisseursRoute
   AppDossiersDossierIdGedRoute: typeof AppDossiersDossierIdGedRoute
   AppDossiersDossierIdPaieRoute: typeof AppDossiersDossierIdPaieRoute
+  AppDossiersDossierIdRelevescannerRoute: typeof AppDossiersDossierIdRelevescannerRoute
   AppDossiersDossierIdIndexRoute: typeof AppDossiersDossierIdIndexRoute
 }
 
@@ -353,6 +374,8 @@ const AppDossiersRouteChildren: AppDossiersRouteChildren = {
   AppDossiersDossierIdFournisseursRoute: AppDossiersDossierIdFournisseursRoute,
   AppDossiersDossierIdGedRoute: AppDossiersDossierIdGedRoute,
   AppDossiersDossierIdPaieRoute: AppDossiersDossierIdPaieRoute,
+  AppDossiersDossierIdRelevescannerRoute:
+    AppDossiersDossierIdRelevescannerRoute,
   AppDossiersDossierIdIndexRoute: AppDossiersDossierIdIndexRoute,
 }
 

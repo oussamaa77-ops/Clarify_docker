@@ -2,10 +2,9 @@ import { createFileRoute, Outlet, Link, useNavigate, useLocation } from "@tansta
 import { useEffect } from "react";
 import { useAuth } from "@/hooks/useAuth";
 import { Button } from "@/components/ui/button";
-import { Receipt, Users2 } from "lucide-react";
 import {
   LayoutDashboard, FileText, Users, Building2, BookOpen, Landmark,
-  FolderArchive, History, LogOut, Briefcase
+  FolderArchive, History, LogOut, Briefcase, Receipt, Users2, FileSearch,
 } from "lucide-react";
 
 export const Route = createFileRoute("/_app")({
@@ -25,23 +24,22 @@ function AppLayout() {
     return <div className="flex min-h-screen items-center justify-center text-muted-foreground">Chargement…</div>;
   }
 
-  // Détecter dossier actif depuis l'URL: /dossiers/<id>/...
   const match = location.pathname.match(/\/dossiers\/([0-9a-f-]{36})/);
   const dossierId = match?.[1];
 
   const navItems = dossierId ? [
-  { to: "/dossiers/$dossierId/dashboard", label: "Dashboard", icon: LayoutDashboard },
-  { to: "/dossiers/$dossierId/factures", label: "Factures", icon: FileText },
-  { to: "/dossiers/$dossierId/clients", label: "Clients", icon: Users },
-  { to: "/dossiers/$dossierId/fournisseurs", label: "Fournisseurs", icon: Building2 },
-  { to: "/dossiers/$dossierId/comptabilite", label: "Comptabilité", icon: BookOpen },
-  { to: `/dossiers/${dossierId}/fiscalite`, label: "Fiscalité", icon: Receipt },
-  { to: `/dossiers/${dossierId}/paie`, label: "Paie & RH", icon: Users2 },
-  { to: "/dossiers/$dossierId/banque", label: "Banque", icon: Landmark },
-  { to: "/dossiers/$dossierId/ged", label: "GED", icon: FolderArchive },
-  { to: "/dossiers/$dossierId/audit", label: "Audit", icon: History },
-  { to: `/dossiers/${dossierId}/relevescanner`, label: "Scanner relevé", icon: ScanLine },
-] : [];
+    { to: "/dossiers/$dossierId/dashboard",     label: "Dashboard",       icon: LayoutDashboard },
+    { to: "/dossiers/$dossierId/factures",      label: "Factures",        icon: FileText        },
+    { to: "/dossiers/$dossierId/clients",       label: "Clients",         icon: Users           },
+    { to: "/dossiers/$dossierId/fournisseurs",  label: "Fournisseurs",    icon: Building2       },
+    { to: "/dossiers/$dossierId/comptabilite",  label: "Comptabilité",    icon: BookOpen        },
+    { to: "/dossiers/$dossierId/fiscalite",     label: "Fiscalité",       icon: Receipt         },
+    { to: "/dossiers/$dossierId/paie",          label: "Paie & RH",       icon: Users2          },
+    { to: "/dossiers/$dossierId/banque",        label: "Banque",          icon: Landmark        },
+    { to: "/dossiers/$dossierId/relevescanner", label: "Scanner relevé",  icon: FileSearch      },
+    { to: "/dossiers/$dossierId/ged",           label: "GED",             icon: FolderArchive   },
+    { to: "/dossiers/$dossierId/audit",         label: "Audit",           icon: History         },
+  ] : [];
 
   return (
     <div className="flex min-h-screen bg-muted/30">
@@ -66,18 +64,18 @@ function AppLayout() {
             <>
               <div className="mt-4 mb-2 px-3 text-xs font-semibold uppercase text-muted-foreground">Dossier actif</div>
               {navItems.map((item) => {
-  const active = location.pathname.includes(item.to.replace("$dossierId", dossierId));
-  return (
-    <Link
-      key={item.to}
-      to={item.to}
-      params={{ dossierId }}
-      className={`flex items-center gap-3 rounded-md px-3 py-2 text-sm hover:bg-accent ${active ? 'bg-accent font-medium' : ''}`}
-    >
-      <item.icon className="h-4 w-4" /> {item.label}
-    </Link>
-  );
-})}
+                const active = location.pathname.includes(item.to.replace("$dossierId", dossierId));
+                return (
+                  <Link
+                    key={item.to}
+                    to={item.to}
+                    params={{ dossierId }}
+                    className={`flex items-center gap-3 rounded-md px-3 py-2 text-sm hover:bg-accent ${active ? "bg-accent font-medium" : ""}`}
+                  >
+                    <item.icon className="h-4 w-4" /> {item.label}
+                  </Link>
+                );
+              })}
             </>
           )}
         </nav>
@@ -87,7 +85,10 @@ function AppLayout() {
             {profile?.prenom} {profile?.nom}<br />
             <span className="opacity-70">{profile?.email}</span>
           </div>
-          <Button variant="ghost" size="sm" className="w-full justify-start" onClick={() => { signOut(); navigate({ to: "/" }); }}>
+          <Button
+            variant="ghost" size="sm" className="w-full justify-start"
+            onClick={() => { signOut(); navigate({ to: "/" }); }}
+          >
             <LogOut className="h-4 w-4 mr-2" /> Déconnexion
           </Button>
         </div>
@@ -99,3 +100,4 @@ function AppLayout() {
     </div>
   );
 }
+
