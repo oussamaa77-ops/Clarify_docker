@@ -1,3 +1,4 @@
+
 import { createFileRoute } from "@tanstack/react-router";
 import { useEffect, useRef, useState } from "react";
 import { supabase } from "@/integrations/supabase/client";
@@ -26,11 +27,19 @@ interface Facture {
   xml_ubl: string | null; hash_sha256: string | null; dgi_uuid: string | null; dgi_response: any;
   fichier_original_url: string | null; fichier_original_nom: string | null; fichier_original_type: string | null;
 }
+// CORRECTION 1 : Interface OcrData avec nouveaux champs acompte
 interface OcrData {
   client_nom_extrait: string; ice_client: string | null; if_fiscal_client: string | null;
   rc_client: string | null; numero_facture: string | null; date_facture: string | null;
   date_echeance: string | null; delai_paiement_jours: number | null; mode_reglement: string | null;
   montant_ht: number; montant_tva: number; montant_ttc: number;
+  // Nouveaux champs acompte
+  type_facture: string;
+  numero_commande: string | null;
+  numero_acompte: number | null;
+  montant_commande_total_ht: number | null;
+  montant_commande_total_ttc: number | null;
+  montant_restant_du: number | null;
   lignes: Ligne[]; confidence: string; method: string;
   client_id: string | null; client_action: "found" | "created" | "not_found"; client_trouve: any;
 }
@@ -65,18 +74,15 @@ function FacturesPage() {
   const [dgiResult, setDgiResult] = useState<any>(null);
   const [processing, setProcessing] = useState<string | null>(null);
 
-  // Email manquant
   const [emailModal, setEmailModal] = useState<{ clientId: string; factureId: string } | null>(null);
   const [emailInput, setEmailInput] = useState("");
 
-  // Form
   const [clientId, setClientId] = useState("");
   const [numero, setNumero] = useState("");
   const [dateF, setDateF] = useState(new Date().toISOString().slice(0, 10));
   const [dateE, setDateE] = useState("");
   const [lignes, setLignes] = useState<Ligne[]>([{ designation: "", quantite: 1, prix_unitaire: 0, taux_tva: 20 }]);
 
-  // OCR
   const [ocrLoading, setOcrLoading] = useState(false);
   const [ocrData, setOcrData] = useState<OcrData | null>(null);
   const [activeTab, setActiveTab] = useState("ocr");
@@ -89,7 +95,7 @@ function FacturesPage() {
       supabase.from("factures").select("*").eq("dossier_id", dossierId).order("date_facture", { ascending: false }),
       supabase.from("clients").select("id,nom,ice,email").eq("dossier_id", dossierId).is("deleted_at", null).order("nom"),
     ]);
-   setFactures((f ?? []) as unknown as Facture[]);
+    setFactures((f ?? []) as unknown as Facture[]);
     setClients((c ?? []) as Client[]);
     setLoading(false);
   };
@@ -123,7 +129,7 @@ function FacturesPage() {
         for (let i = 1; i <= pdf.numPages; i++) {
           const page = await pdf.getPage(i);
           const content = await page.getTextContent();
-          fullText += content.items.map((item: any) => item.str).join(" ") + "\n";
+          fullText += content.items.map((item: any) => item.str).join(" ") + "\\n";
         }
         extractedText = fullText.trim();
       } else if (isExcel) {
@@ -133,7 +139,7 @@ function FacturesPage() {
         let allText = "";
         for (const sheetName of workbook.SheetNames) {
           const sheet = workbook.Sheets[sheetName];
-          allText += `[Feuille: ${sheetName}]\n${XLSX.utils.sheet_to_csv(sheet, { blankrows: false })}\n\n`;
+          allText += `[Feuille: ${sheetName}]\\n${XLSX.utils.sheet_to_csv(sheet, { blankrows: false })}\\n\\n`;
         }
         extractedText = allText.trim();
       } else if (isImage) {
@@ -155,7 +161,21 @@ function FacturesPage() {
       const result = await ocrFn({ data: { extracted_text: extractedText, image_base64, mime_type, dossier_id: dossierId } });
       const r = result.result as OcrData;
       setOcrData(r);
-      if (r.client_id) setClientId(r.client_id);
+
+      // CORRECTION 2 : Vérifier que le client détecté n'est pas la propre société du dossier
+      if (r.client_id && r.client_action !== "not_found") {
+        const { data: dossierData } = await supabase.from("dossiers").select("nom_societe").eq("id", dossierId).single();
+        const nomSociete = (dossierData?.nom_societe ?? "").toLowerCase();
+        const nomClient  = (r.client_nom_extrait ?? "").toLowerCase();
+        // Si le nom détecté ressemble au nom de la société → c'est l'émetteur, pas le client
+        const estEmetteur = nomSociete.length > 3 && nomClient.includes(nomSociete.slice(0, 6));
+        if (!estEmetteur) {
+          setClientId(r.client_id);
+        } else {
+          toast.warning("Le client détecté semble être votre propre société — sélectionnez le bon client manuellement");
+        }
+      }
+
       if (r.numero_facture) setNumero(r.numero_facture);
       if (r.date_facture) setDateF(r.date_facture);
       if (r.date_echeance) setDateE(r.date_echeance);
@@ -180,7 +200,6 @@ function FacturesPage() {
     }).select().single();
     if (error) return toast.error(error.message);
 
-    // Uploader le fichier original si présent
     if (originalFile && newFact) {
       const ext = originalFile.name.split(".").pop();
       const path = `${dossierId}/${newFact.id}.${ext}`;
@@ -188,10 +207,10 @@ function FacturesPage() {
       if (uploadData) {
         const { data: urlData } = supabase.storage.from("factures-originales").getPublicUrl(path);
         await (supabase.from("factures") as any).update({
-  fichier_original_url: urlData?.publicUrl ?? null,
-  fichier_original_nom: originalFile.name,
-  fichier_original_type: originalFile.type,
-}).eq("id", newFact.id);
+          fichier_original_url: urlData?.publicUrl ?? null,
+          fichier_original_nom: originalFile.name,
+          fichier_original_type: originalFile.type,
+        }).eq("id", newFact.id);
       }
     }
 
@@ -240,7 +259,6 @@ function FacturesPage() {
       await addEmailFn({ data: { client_id: emailModal.clientId, email: emailInput } });
       toast.success("Email ajouté");
       await load();
-      // Relancer l'envoi DGI
       const f = factures.find(f => f.id === emailModal.factureId);
       if (f) { setEmailModal(null); setEmailInput(""); handleGenXmlSansEmail(f.id); }
     } catch (e: any) { toast.error(e.message); }
@@ -260,7 +278,6 @@ function FacturesPage() {
     if (f.fichier_original_url) window.open(f.fichier_original_url, "_blank");
   };
 
-  // KPIs — uniquement sur factures conformes
   const conformes = factures.filter(f => f.statut === "conforme");
   const caHT = conformes.reduce((s, f) => s + Number(f.montant_ht), 0);
   const encours = conformes.filter(f => f.statut_paiement !== "payee").reduce((s, f) => s + Number(f.montant_ttc), 0);
@@ -324,6 +341,7 @@ function FacturesPage() {
                       ))}
                     </div>
 
+                    {/* Montants principaux */}
                     <Card className={Number(ocrData.montant_ttc) > 0 ? "border-green-200" : "border-red-200"}>
                       <CardContent className="pt-3 pb-3 flex justify-between items-center">
                         <div>
@@ -333,6 +351,49 @@ function FacturesPage() {
                         <p className="text-xs text-muted-foreground">{ocrData.lignes?.length} ligne(s)</p>
                       </CardContent>
                     </Card>
+
+                    {/* CORRECTION 3A : Badge type facture */}
+                    {ocrData.type_facture && ocrData.type_facture !== "standard" && (
+                      <div className="flex items-center gap-2">
+                        <Badge className={
+                          ocrData.type_facture === "acompte" ? "bg-blue-100 text-blue-700" :
+                          ocrData.type_facture === "solde"   ? "bg-purple-100 text-purple-700" :
+                          ocrData.type_facture === "avoir"   ? "bg-red-100 text-red-700" : ""
+                        }>
+                          {ocrData.type_facture === "acompte" ? `🔵 Acompte ${ocrData.numero_acompte ?? ""}` :
+                           ocrData.type_facture === "solde"   ? "🟣 Facture de solde" :
+                           ocrData.type_facture === "avoir"   ? "🔴 Avoir / Crédit" : ""}
+                        </Badge>
+                        {ocrData.numero_commande && (
+                          <span className="text-xs text-muted-foreground">Commande : {ocrData.numero_commande}</span>
+                        )}
+                      </div>
+                    )}
+
+                    {/* CORRECTION 3B : Bloc acompte détaillé */}
+                    {ocrData.type_facture === "acompte" && (
+                      <Card className="border-blue-200 bg-blue-50/50 dark:bg-blue-950/10">
+                        <CardContent className="pt-3 pb-3 space-y-2">
+                          <p className="text-xs font-semibold text-blue-700">Détail de la commande</p>
+                          {ocrData.montant_commande_total_ttc && (
+                            <div className="flex justify-between text-xs">
+                              <span className="text-muted-foreground">Total commande TTC</span>
+                              <span className="font-mono">{fmt(ocrData.montant_commande_total_ttc)}</span>
+                            </div>
+                          )}
+                          <div className="flex justify-between text-xs text-green-700">
+                            <span className="font-medium">Cet acompte (facturé)</span>
+                            <span className="font-mono font-semibold">{fmt(ocrData.montant_ttc)}</span>
+                          </div>
+                          {ocrData.montant_restant_du && (
+                            <div className="flex justify-between text-xs text-orange-700 border-t border-orange-200 pt-1">
+                              <span className="font-semibold">Reliquat restant dû</span>
+                              <span className="font-mono font-semibold">{fmt(ocrData.montant_restant_du)}</span>
+                            </div>
+                          )}
+                        </CardContent>
+                      </Card>
+                    )}
 
                     {ocrData.lignes?.length > 0 && (
                       <div className="rounded-lg border overflow-hidden">
@@ -356,7 +417,7 @@ function FacturesPage() {
               </TabsContent>
 
               <TabsContent value="formulaire" className="mt-4 space-y-4">
-                {ocrData && <div className="p-3 bg-blue-50 dark:bg-blue-950/20 rounded-lg text-xs text-blue-700 dark:text-blue-300 border border-blue-200">✅ Données pré-remplies depuis l'OCR — vérifiez avant de créer.</div>}
+                {ocrData && <div className="p-3 bg-blue-50 dark:bg-blue-950/20 rounded-lg text-xs text-blue-700 dark:text-blue-300 border border-blue-200">✅ Données pré-remplies depuis l\'OCR — vérifiez avant de créer.</div>}
                 <div className="grid grid-cols-2 gap-4">
                   <div className="space-y-2">
                     <Label>Client *</Label>
@@ -401,7 +462,6 @@ function FacturesPage() {
         </Dialog>
       </div>
 
-      {/* KPIs — uniquement sur conformes */}
       <div className="grid grid-cols-4 gap-4 mb-6">
         {[
           { label: "CA HT (conformes DGI)", value: fmt(caHT), color: "text-green-600" },
@@ -416,7 +476,6 @@ function FacturesPage() {
         ))}
       </div>
 
-      {/* Table */}
       <Card>
         <CardContent className="p-0">
           <Table>
@@ -480,62 +539,27 @@ function FacturesPage() {
         </CardContent>
       </Card>
 
-      {/* Modal email manquant */}
       <Dialog open={!!emailModal} onOpenChange={() => { setEmailModal(null); setEmailInput(""); }}>
         <DialogContent>
           <DialogHeader><DialogTitle>Email client manquant</DialogTitle></DialogHeader>
           <div className="space-y-4">
             <p className="text-sm text-muted-foreground">
-              L'email du client est requis pour lui envoyer la facture. Ajoutez-le maintenant ou continuez sans envoi.
+              L'email du client est requis pour envoyer la facture.
             </p>
-            <div className="space-y-2">
-              <Label>Adresse email du client</Label>
-              <Input type="email" placeholder="client@exemple.ma" value={emailInput} onChange={e => setEmailInput(e.target.value)}
-                onKeyDown={e => { if (e.key === "Enter") handleAddEmail(); }} />
+            <div className="space-y-2 mt-4">
+              <Label>Adresse email</Label>
+              <Input 
+                type="email" 
+                placeholder="client@exemple.ma" 
+                value={emailInput} 
+                onChange={(e) => setEmailInput(e.target.value)} 
+              />
             </div>
           </div>
-          <DialogFooter className="gap-2">
-            <Button variant="outline" onClick={() => emailModal && handleGenXmlSansEmail(emailModal.factureId)}>
-              Continuer sans email
-            </Button>
-            <Button onClick={handleAddEmail} disabled={!emailInput}>
-              <Mail className="h-4 w-4 mr-2" />Ajouter et envoyer
-            </Button>
+          <DialogFooter className="mt-4">
+            <Button variant="outline" onClick={() => setEmailModal(null)}>Plus tard</Button>
+            <Button onClick={handleAddEmail}>Enregistrer et continuer</Button>
           </DialogFooter>
-        </DialogContent>
-      </Dialog>
-
-      {/* DGI Result */}
-      <Dialog open={!!dgiResult} onOpenChange={() => setDgiResult(null)}>
-        <DialogContent>
-          <DialogHeader><DialogTitle>{dgiResult?.conforme ? "✅ Facture conforme DGI" : "❌ Facture rejetée"}</DialogTitle></DialogHeader>
-          {dgiResult && (
-            <div className={`p-4 rounded-lg text-sm space-y-2 ${dgiResult.conforme ? "bg-green-50 dark:bg-green-950/20" : "bg-red-50 dark:bg-red-950/20"}`}>
-              <p>{dgiResult.dgi_response?.message}</p>
-              {dgiResult.dgi_uuid && <p className="font-mono text-xs break-all">UUID DGI: {dgiResult.dgi_uuid}</p>}
-              {dgiResult.hash && <p className="font-mono text-xs break-all">SHA-256: {dgiResult.hash.slice(0, 32)}…</p>}
-              {dgiResult.email_sent && <p className="text-xs text-green-600">📧 Email envoyé au client</p>}
-              {dgiResult.client_email_manquant && <p className="text-xs text-orange-500">⚠️ Email client non renseigné — facture non envoyée par email</p>}
-              {dgiResult.dgi_response?.erreurs?.length > 0 && (
-                <ul>{dgiResult.dgi_response.erreurs.map((e: string, i: number) => <li key={i} className="text-red-600 text-xs">• {e}</li>)}</ul>
-              )}
-              {dgiResult.conforme && <p className="text-xs text-muted-foreground border-t pt-2 mt-2">✅ Écritures comptables créées (PCM) · Document archivé en GED</p>}
-            </div>
-          )}
-          <DialogFooter><Button onClick={() => setDgiResult(null)}>Fermer</Button></DialogFooter>
-        </DialogContent>
-      </Dialog>
-
-      {/* XML Viewer */}
-      <Dialog open={!!viewXml} onOpenChange={() => setViewXml(null)}>
-        <DialogContent className="max-w-3xl">
-          <DialogHeader><DialogTitle>XML UBL 2.1 — {viewXml?.numero}</DialogTitle></DialogHeader>
-          <Button size="sm" variant="outline" className="w-fit" onClick={() => {
-            const blob = new Blob([viewXml!.xml_ubl!], { type: "application/xml" });
-            const a = document.createElement("a"); a.href = URL.createObjectURL(blob);
-            a.download = `${viewXml!.numero ?? viewXml!.id}.xml`; a.click();
-          }}><Download className="h-4 w-4 mr-1" />Télécharger XML</Button>
-          <pre className="bg-muted p-4 rounded text-xs overflow-auto max-h-96 font-mono whitespace-pre-wrap">{viewXml?.xml_ubl}</pre>
         </DialogContent>
       </Dialog>
     </div>

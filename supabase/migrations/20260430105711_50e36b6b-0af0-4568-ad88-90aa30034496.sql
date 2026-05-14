@@ -431,3 +431,47 @@ CREATE POLICY "ged_user_insert" ON storage.objects FOR INSERT TO authenticated
   WITH CHECK (bucket_id = 'ged' AND auth.uid() IS NOT NULL);
 CREATE POLICY "ged_user_delete" ON storage.objects FOR DELETE TO authenticated
   USING (bucket_id = 'ged' AND auth.uid() IS NOT NULL);
+
+-- Migration : support factures d'acompte
+ALTER TABLE public.factures 
+  ADD COLUMN IF NOT EXISTS type_facture TEXT DEFAULT 'standard' 
+    CHECK (type_facture IN ('standard', 'acompte', 'solde', 'avoir')),
+  ADD COLUMN IF NOT EXISTS numero_commande TEXT,
+  ADD COLUMN IF NOT EXISTS numero_acompte INTEGER,
+  ADD COLUMN IF NOT EXISTS montant_commande_total_ht NUMERIC(12,2),
+  ADD COLUMN IF NOT EXISTS montant_commande_total_ttc NUMERIC(12,2),
+  ADD COLUMN IF NOT EXISTS montant_restant_du NUMERIC(12,2),
+  ADD COLUMN IF NOT EXISTS facture_parent_id UUID REFERENCES public.factures(id);
+
+CREATE INDEX IF NOT EXISTS idx_factures_commande 
+  ON public.factures(numero_commande) WHERE numero_commande IS NOT NULL;
+
+-- Données de test : FA 0005 AGAF
+-- (à exécuter après avoir créé le client AGAF et le dossier)
+/*
+INSERT INTO public.factures (
+  dossier_id, numero, date_facture, date_echeance,
+  type_facture, numero_commande, numero_acompte,
+  montant_ht, montant_tva, montant_ttc,
+  montant_commande_total_ht, montant_commande_total_ttc,
+  montant_restant_du,
+  statut, statut_paiement
+) VALUES (
+  'VOTRE_DOSSIER_ID',
+  'FA 0005',
+  '2026-03-11',
+  '2026-04-10',        -- échéance 30j
+  'acompte',
+  'BC 014025',
+  1,
+  42000.00,
+  8400.00,
+  50400.00,
+  140783.21,           -- total commande HT
+  168939.85,           -- total commande TTC
+  118539.85,           -- reliquat restant
+  'conforme',
+  'payee'              -- payée par virement AGA du 02/03/2026
+);
+*/
+

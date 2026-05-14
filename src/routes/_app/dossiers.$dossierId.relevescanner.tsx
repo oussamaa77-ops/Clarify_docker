@@ -171,8 +171,8 @@ function RelEveScanner() {
 
   useEffect(() => {
     Promise.all([
-      supabase.from("factures").select("id,numero,montant_ht,montant_ttc,montant_tva,clients(id,nom,ice)").eq("dossier_id", dossierId).eq("statut", "conforme").neq("statut_paiement", "payee"),
-      (supabase as any).from("factures_fournisseurs").select("id,numero,montant_ht,montant_ttc,montant_tva,fournisseur_nom,fournisseur_id").eq("dossier_id", dossierId).neq("statut_paiement", "payee"),
+      supabase.from("factures").select("id,numero,montant_ht,montant_ttc,montant_tva,date_facture,date_echeance,clients(id,nom,ice)").eq("dossier_id", dossierId).eq("statut", "conforme").neq("statut_paiement", "payee"),
+      (supabase as any).from("factures_fournisseurs").select("id,numero,montant_ht,montant_ttc,montant_tva,date_facture,date_echeance,fournisseur_nom,fournisseur_id").eq("dossier_id", dossierId).neq("statut_paiement", "payee"),
       (supabase as any).from("fournisseurs").select("id,nom,ice").eq("dossier_id", dossierId),
       supabase.from("clients").select("id,nom,ice").eq("dossier_id", dossierId),
     ]).then(([{ data: f }, { data: ff }, { data: fo }, { data: cl }]) => {

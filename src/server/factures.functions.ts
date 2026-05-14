@@ -20,16 +20,12 @@ const ligneSchema = z.object({
   taux_tva: z.number().min(0).max(100).default(20),
 });
 
-// ─── Simulation DGI réaliste avec délai ──────────────────────────────────────
-// Architecture prête pour brancher AJAL quand l'API sera publique
-
 // ─── Envoi email via Resend ───────────────────────────────────────────────────
 async function envoyerEmail(to: string, subject: string, html: string): Promise<boolean> {
   const resendKey = process.env.RESEND_API_KEY;
   const fromEmail = process.env.FROM_EMAIL ?? "onboarding@resend.dev";
   if (!resendKey) { console.log("[EMAIL] RESEND_API_KEY manquante"); return false; }
   try {
-    console.log("[EMAIL] Envoi vers:", to, "depuis:", fromEmail);
     const res = await fetch("https://api.resend.com/emails", {
       method: "POST",
       headers: { Authorization: `Bearer ${resendKey}`, "Content-Type": "application/json" },
@@ -56,14 +52,14 @@ export const generateFactureXml = createServerFn({ method: "POST" })
 
     const lignes = ((facture.lignes ?? []) as unknown[]).map((l) => ligneSchema.parse(l));
     const societe = (facture as any).dossiers;
-    const client = (facture as any).clients;
+    const client  = (facture as any).clients;
 
     const esc = (s: string | null | undefined) =>
       (s ?? "").replace(/[<>&'"]/g, (c: string) =>
         (({ "<": "&lt;", ">": "&gt;", "&": "&amp;", "'": "&apos;", '"': "&quot;" }) as Record<string, string>)[c]);
 
     const lignesXml = lignes.map((l, i) => {
-      const ht = l.quantite * l.prix_unitaire;
+      const ht  = l.quantite * l.prix_unitaire;
       const tva = ht * (l.taux_tva / 100);
       return `  <cac:InvoiceLine>
     <cbc:ID>${i + 1}</cbc:ID>
@@ -82,10 +78,10 @@ export const generateFactureXml = createServerFn({ method: "POST" })
     }).join("\n");
 
     if (facture.date_echeance && facture.date_echeance <= facture.date_facture) {
-  const d = new Date(facture.date_facture);
-  d.setDate(d.getDate() + 30);
-  (facture as any).date_echeance = d.toISOString().slice(0, 10);
-}
+      const d = new Date(facture.date_facture);
+      d.setDate(d.getDate() + 30);
+      (facture as any).date_echeance = d.toISOString().slice(0, 10);
+    }
 
     const xml = `<?xml version="1.0" encoding="UTF-8"?>
 <Invoice xmlns="urn:oasis:names:specification:ubl:schema:xsd:Invoice-2"
@@ -120,15 +116,10 @@ ${lignesXml}
 
     const hash = createHash("sha256").update(xml).digest("hex");
 
-    // ── Étape 1 : passer en statut "en_analyse_dgi" immédiatement ────────
     await supabase.from("factures").update({
-      xml_ubl: xml,
-      hash_sha256: hash,
-      statut: "envoyee",
-      statut_dgi: "en_analyse",
+      xml_ubl: xml, hash_sha256: hash, statut: "envoyee", statut_dgi: "en_analyse",
     }).eq("id", data.facture_id);
 
-    // ── Étape 2 : envoyer à DGI (simulation avec délai réaliste) ─────────
     const validation = await validerXmlUBL(xml);
     const { conforme, erreurs, avertissements, source } = validation;
 
@@ -137,37 +128,47 @@ ${lignesXml}
       : null;
 
     const dgi_response = {
-      source,                    // "peppol" ou "simulation"
-      conforme,
-      timestamp: new Date().toISOString(),
-      uuid: dgi_uuid,
+      source, conforme, timestamp: new Date().toISOString(), uuid: dgi_uuid,
       message: conforme
         ? source === "peppol"
           ? "Facture validée par le validateur PEPPOL UBL 2.1 (conforme DGI-MA)"
           : "Facture validée localement — structure UBL 2.1 conforme"
         : "Facture rejetée — erreurs de conformité UBL détectées",
-      erreurs,
-      avertissements,
+      erreurs, avertissements,
     };
 
-    // ── Étape 3 : mettre à jour avec résultat réel ────────────────────────
     await supabase.from("factures").update({
-      dgi_uuid,
-      dgi_response,
+      dgi_uuid, dgi_response,
       statut: conforme ? "conforme" : "rejetee",
       statut_dgi: conforme ? "conforme" : "rejetee",
     }).eq("id", data.facture_id);
 
-    // ── Étape 4 : comptabilisation UNIQUEMENT si conforme ────────────────
     if (conforme && Number(facture.montant_ttc) > 0) {
-      const ref = facture.numero ?? facture.id;
-      await supabase.from("ecritures_comptables").insert([
-        { dossier_id: facture.dossier_id, journal_code: "VTE", compte_numero: "3421", date_ecriture: facture.date_facture, libelle: `Vente ${ref}`, debit: Number(facture.montant_ttc), credit: 0, reference_piece: ref, facture_id: facture.id, valide: true },
-        { dossier_id: facture.dossier_id, journal_code: "VTE", compte_numero: "7111", date_ecriture: facture.date_facture, libelle: `Vente ${ref}`, debit: 0, credit: Number(facture.montant_ht), reference_piece: ref, facture_id: facture.id, valide: true },
-        { dossier_id: facture.dossier_id, journal_code: "VTE", compte_numero: "44551", date_ecriture: facture.date_facture, libelle: `TVA collectée ${ref}`, debit: 0, credit: Number(facture.montant_tva), reference_piece: ref, facture_id: facture.id, valide: true },
-      ]);
+      const ref         = facture.numero ?? facture.id;
+      const typeFacture = (facture as any).type_facture ?? "standard";
 
-      // GED archivage
+      if (typeFacture === "acompte") {
+        await supabase.from("ecritures_comptables").insert([
+          { dossier_id: facture.dossier_id, journal_code: "VTE", compte_numero: "3421",  date_ecriture: facture.date_facture, libelle: `Acompte ${ref}`,          debit: Number(facture.montant_ttc), credit: 0,                     reference_piece: ref, facture_id: facture.id, valide: true },
+          { dossier_id: facture.dossier_id, journal_code: "VTE", compte_numero: "4191",  date_ecriture: facture.date_facture, libelle: `Avance reçue ${ref}`,      debit: 0, credit: Number(facture.montant_ht),                      reference_piece: ref, facture_id: facture.id, valide: true },
+          { dossier_id: facture.dossier_id, journal_code: "VTE", compte_numero: "44551", date_ecriture: facture.date_facture, libelle: `TVA acompte ${ref}`,       debit: 0, credit: Number(facture.montant_tva),                     reference_piece: ref, facture_id: facture.id, valide: true },
+        ]);
+      } else if (typeFacture === "solde") {
+        await supabase.from("ecritures_comptables").insert([
+          { dossier_id: facture.dossier_id, journal_code: "VTE", compte_numero: "3421",  date_ecriture: facture.date_facture, libelle: `Solde ${ref}`,             debit: Number(facture.montant_ttc), credit: 0,                     reference_piece: ref, facture_id: facture.id, valide: true },
+          { dossier_id: facture.dossier_id, journal_code: "VTE", compte_numero: "7111",  date_ecriture: facture.date_facture, libelle: `Vente solde ${ref}`,        debit: 0, credit: Number(facture.montant_ht),                      reference_piece: ref, facture_id: facture.id, valide: true },
+          { dossier_id: facture.dossier_id, journal_code: "VTE", compte_numero: "44551", date_ecriture: facture.date_facture, libelle: `TVA solde ${ref}`,          debit: 0, credit: Number(facture.montant_tva),                     reference_piece: ref, facture_id: facture.id, valide: true },
+          { dossier_id: facture.dossier_id, journal_code: "OD",  compte_numero: "4191",  date_ecriture: facture.date_facture, libelle: `Imputation acompte ${ref}`, debit: Number(facture.montant_ht), credit: 0,                      reference_piece: ref, facture_id: facture.id, valide: true },
+          { dossier_id: facture.dossier_id, journal_code: "OD",  compte_numero: "7111",  date_ecriture: facture.date_facture, libelle: `Imputation acompte ${ref}`, debit: 0, credit: Number(facture.montant_ht),                      reference_piece: ref, facture_id: facture.id, valide: true },
+        ]);
+      } else {
+        await supabase.from("ecritures_comptables").insert([
+          { dossier_id: facture.dossier_id, journal_code: "VTE", compte_numero: "3421",  date_ecriture: facture.date_facture, libelle: `Vente ${ref}`,             debit: Number(facture.montant_ttc), credit: 0,                     reference_piece: ref, facture_id: facture.id, valide: true },
+          { dossier_id: facture.dossier_id, journal_code: "VTE", compte_numero: "7111",  date_ecriture: facture.date_facture, libelle: `Vente ${ref}`,             debit: 0, credit: Number(facture.montant_ht),                      reference_piece: ref, facture_id: facture.id, valide: true },
+          { dossier_id: facture.dossier_id, journal_code: "VTE", compte_numero: "44551", date_ecriture: facture.date_facture, libelle: `TVA collectée ${ref}`,     debit: 0, credit: Number(facture.montant_tva),                     reference_piece: ref, facture_id: facture.id, valide: true },
+        ]);
+      }
+
       await supabase.from("ged_documents").insert({
         dossier_id: facture.dossier_id, facture_id: facture.id,
         nom_fichier: `${facture.numero ?? facture.id}.xml`, type_document: "facture_client",
@@ -175,7 +176,6 @@ ${lignesXml}
         taille_bytes: xml.length, mime_type: "application/xml",
       });
 
-      // ── Étape 5 : email client UNIQUEMENT si conforme ──────────────────
       if (client?.email) {
         const { subject, html } = emailFactureClient({
           clientNom: client.nom, numeroFacture: facture.numero ?? facture.id,
@@ -185,7 +185,6 @@ ${lignesXml}
         await envoyerEmail(client.email, subject, html);
       }
     } else if (!conforme) {
-      // Email de rejet au comptable
       const { data: prof } = await supabase.from("profiles").select("email").limit(1).maybeSingle();
       if (prof?.email) {
         const { subject, html } = emailFactureRejetee({
@@ -196,7 +195,6 @@ ${lignesXml}
       }
     }
 
-    // Audit log
     await supabase.from("audit_logs").insert({
       dossier_id: facture.dossier_id,
       action: conforme ? "efacture_conforme" : "efacture_rejetee",
@@ -268,71 +266,153 @@ export const ocrFacture = createServerFn({ method: "POST" })
       numero_facture: null, date_facture: null, date_echeance: null,
       delai_paiement_jours: null, mode_reglement: null,
       montant_ht: 0, montant_tva: 0, montant_ttc: 0, lignes: [],
+      type_facture: "standard",
+      numero_commande: null, numero_acompte: null,
+      montant_commande_total_ht: null, montant_commande_total_ttc: null,
+      montant_restant_du: null,
     };
     let confidence: "high" | "medium" | "low" = "low";
     let method: "regex" | "ai" = "regex";
 
     const groqKey = process.env.GROQ_API_KEY;
-    console.log("[OCR] groqKey:", groqKey ? "present" : "ABSENT", "| image:", data.image_base64 ? "yes" : "no", "| text:", text.length);
 
     if (groqKey) {
       try {
-        const prompt = `Tu es un expert comptable marocain. Analyse cette facture en détail.
-Lis TOUS les textes, même en gras, gris, petit, ou en pied de page.
-Le CLIENT est le DESTINATAIRE de la facture (pas l'émetteur/fournisseur).
-Cherche : nom client, ICE client, numéro facture, date, échéance ou délai, mode règlement, montants, lignes.
+        // ── PROMPT FINAL — générique, sans exemple spécifique ────────────────
+        const prompt = `Tu es un expert-comptable et analyste de documents financiers. Tu dois extraire les données d'une facture avec une précision maximale.
 
-Retourne UNIQUEMENT ce JSON (sans markdown) :
+RÈGLE FONDAMENTALE — IDENTIFIER LES PARTIES :
+Une facture a TOUJOURS deux parties :
+1. L'ÉMETTEUR (vendeur) = celui qui ÉMET la facture et demande le paiement
+   → Identifié par : son en-tête, ses coordonnées fiscales (RC, IF, ICE, CNSS, TP), son logo
+   → Peut être n'importe où (haut, bas, gauche, droite)
+   → NE JAMAIS mettre l'émetteur dans client_nom
+
+2. LE CLIENT (acheteur) = celui qui REÇOIT la facture et doit PAYER
+   → Identifié UNIQUEMENT par les mots-clés : "Client :", "Facturer à :", "Bill to :",
+     "Destinataire :", "Adressé à :", "À l'attention de :", "Envoyé à :", bloc "CLIENT"
+   → Peut être n'importe où sur la facture
+   → client_nom = UNIQUEMENT le nom du client, jamais l'émetteur
+
+RÈGLE CRITIQUE : Ne JAMAIS confondre l'émetteur avec le client.
+La présence des coordonnées fiscales (RC, IF, ICE, CNSS, TP) identifie l'émetteur, pas le client.
+
+EXTRACTION ICE :
+- Format ICE marocain : exactement 15 chiffres consécutifs
+- L'ICE qui suit "Client :" ou "CE :" dans le bloc client = client_ice
+- L'ICE dans l'en-tête ou pied de page de l'émetteur = emetteur_ice uniquement
+
+DÉTECTION TYPE DE FACTURE :
+- "acompte" → présence des mots : acompte, avance, versement, arrhes, provision, reliquat, solde restant dû
+- "solde"   → facture finale après acomptes, solde de tout compte
+- "avoir"   → avoir, note de crédit, remboursement, annulation
+- "standard"→ facture normale sans ces mots
+
+RÈGLES MONTANTS — FACTURE D'ACOMPTE :
+La facture peut contenir PLUSIEURS montants :
+- Montant COMMANDE TOTALE → montant_commande_total_ttc (ne pas mettre dans montant_ttc)
+- Montant de CET ACOMPTE → montant_ttc (cherche "Total TTC" dans le récapitulatif)
+- RELIQUAT restant → montant_restant_du (cherche "reliquat", "reste à payer", "solde restant")
+→ montant_ttc = UNIQUEMENT le montant de cette facture, jamais le total commande
+
+NORMALISATION LIGNES :
+- Toujours retourner : description, quantite, prix_unitaire_ht, total_ht, taux_tva
+- Si prix_unitaire_ht absent : calculer total_ht / quantite
+- Taux TVA par défaut au Maroc : 20
+
+Réponds UNIQUEMENT avec ce JSON valide, sans markdown, sans backticks :
 {
-  "client_nom_extrait": "nom du client destinataire",
-  "ice_client": "ICE 15 chiffres ou null",
-  "if_fiscal_client": "IF ou null",
-  "rc_client": "RC ou null",
-  "numero_facture": "numéro ou null",
-  "date_facture": "YYYY-MM-DD ou null",
+  "client_nom": "nom exact du CLIENT qui paie (jamais l'émetteur)",
+  "client_ice": "exactement 15 chiffres ou null",
+  "client_adresse": "adresse du client ou null",
+  "emetteur_nom": "nom de la société émettrice",
+  "emetteur_ice": "ICE émetteur ou null",
+  "numero": "numéro de facture ou null",
+  "date": "YYYY-MM-DD ou null",
   "date_echeance": "YYYY-MM-DD ou null",
-  "delai_paiement_jours": null,
-  "mode_reglement": "virement ou cheque ou especes ou null",
+  "type_facture": "standard|acompte|solde|avoir",
+  "numero_commande": "numéro BC/commande ou null",
+  "numero_acompte": null,
   "montant_ht": 0,
   "montant_tva": 0,
+  "taux_tva": 20,
   "montant_ttc": 0,
-  "lignes": [{"designation": "string", "quantite": 1, "prix_unitaire": 0, "taux_tva": 20}]
+  "montant_commande_total_ht": null,
+  "montant_commande_total_ttc": null,
+  "montant_restant_du": null,
+  "description": "description courte de la prestation",
+  "lignes": [
+    {
+      "description": "désignation",
+      "quantite": 1,
+      "prix_unitaire_ht": 0.00,
+      "total_ht": 0.00,
+      "taux_tva": 20
+    }
+  ]
 }`;
 
         const userContent: any[] = [];
         if (data.image_base64) {
-          userContent.push({ type: "image_url", image_url: { url: `data:${data.mime_type};base64,${data.image_base64}` } });
+          userContent.push({
+            type: "image_url",
+            image_url: { url: `data:${data.mime_type};base64,${data.image_base64}` },
+          });
         }
-        userContent.push({ type: "text", text: prompt + (text ? `\n\nTexte extrait :\n${text.slice(0, 3000)}` : "") });
+        userContent.push({
+          type: "text",
+          text: prompt + (text ? `\n\nTexte extrait de la facture :\n${text.slice(0, 3000)}` : ""),
+        });
 
         const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
           method: "POST",
           headers: { "Content-Type": "application/json", "Authorization": `Bearer ${groqKey}` },
-          body: JSON.stringify({ model: "meta-llama/llama-4-scout-17b-16e-instruct", max_tokens: 1500, messages: [{ role: "user", content: userContent }] }),
+          body: JSON.stringify({
+            model: "meta-llama/llama-4-scout-17b-16e-instruct",
+            max_tokens: 1500,
+            messages: [{ role: "user", content: userContent }],
+          }),
         });
 
-        console.log("[OCR] Groq status:", res.status);
         if (res.ok) {
           const resData = await res.json();
           const content = resData.choices?.[0]?.message?.content ?? "{}";
-          console.log("[OCR] Groq response:", content.slice(0, 400));
+          console.log("[OCR] Groq response:", content.slice(0, 500));
           const matchJson = content.match(/\{[\s\S]*\}/);
           if (matchJson) {
             const ai = JSON.parse(matchJson[0]);
-            result = { ...result, ...ai };
+            result = {
+              ...result,
+              client_nom_extrait:         ai.client_nom                          ?? "",
+              ice_client:                 ai.client_ice                          ?? null,
+              numero_facture:             ai.numero                              ?? null,
+              date_facture:               ai.date                                ?? null,
+              date_echeance:              ai.date_echeance                       ?? null,
+              montant_ht:                 Number(ai.montant_ht)                  || 0,
+              montant_tva:                Number(ai.montant_tva)                 || 0,
+              montant_ttc:                Number(ai.montant_ttc)                 || 0,
+              type_facture:               ai.type_facture                        ?? "standard",
+              numero_commande:            ai.numero_commande                     ?? null,
+              numero_acompte:             ai.numero_acompte                      ?? null,
+              montant_commande_total_ht:  Number(ai.montant_commande_total_ht)   || null,
+              montant_commande_total_ttc: Number(ai.montant_commande_total_ttc)  || null,
+              montant_restant_du:         Number(ai.montant_restant_du)          || null,
+              lignes: (ai.lignes ?? []).map((l: any) => ({
+                designation:   l.description ?? l.designation                       ?? "Prestation",
+                quantite:      Number(l.quantite)                                   || 1,
+                prix_unitaire: Number(l.prix_unitaire_ht ?? l.prix_unitaire)        || 0,
+                taux_tva:      Number(l.taux_tva)                                   || 20,
+              })),
+            };
             confidence = "high";
-            method = "ai";
-            // Calculer date échéance depuis délai si non fournie
+            method     = "ai";
             if (!result.delai_paiement_jours) result.delai_paiement_jours = 30;
-if (!result.date_echeance && result.date_facture) {
-  const dateF = new Date(result.date_facture);
-  const delai = result.delai_paiement_jours ?? 30;
-  dateF.setDate(dateF.getDate() + delai);
-  const dateEcheance = dateF.toISOString().slice(0, 10);
-  if (dateEcheance > result.date_facture) {
-    result.date_echeance = dateEcheance;
-  }
-}
+            if (!result.date_echeance && result.date_facture) {
+              const dateF = new Date(result.date_facture);
+              dateF.setDate(dateF.getDate() + (result.delai_paiement_jours ?? 30));
+              const ech = dateF.toISOString().slice(0, 10);
+              if (ech > result.date_facture) result.date_echeance = ech;
+            }
           }
         } else {
           const err = await res.text();
@@ -341,19 +421,40 @@ if (!result.date_echeance && result.date_facture) {
       } catch (e) { console.log("[OCR] exception:", String(e)); }
     }
 
-    // Regex complète les champs manquants
-    if (!result.ice_client) result.ice_client = norm.match(/ICE\s*[:\-]?\s*(\d{15})/i)?.[1] ?? null;
-    if (!result.numero_facture) result.numero_facture = norm.match(/(?:n°\s*facture|facture\s*n°|numéro)\s*[:\-]?\s*([A-Z0-9\/\-]+)/i)?.[1] ?? null;
-    if (!result.montant_ttc || result.montant_ttc === 0) {
-      const amounts = [...norm.matchAll(/(\d[\d\s]*(?:[,\.]\d{1,2})?)\s*(?:MAD|DH)?/g)]
-        .map(m => parseFloat(m[1].replace(/\s/g, "").replace(",", "."))).filter(n => !isNaN(n) && n > 0 && n < 100_000_000).sort((a, b) => b - a);
-      if (amounts[0]) { result.montant_ttc = amounts[0]; result.montant_ht = amounts[1] ?? Math.round(amounts[0] / 1.2 * 100) / 100; result.montant_tva = Math.round((result.montant_ttc - result.montant_ht) * 100) / 100; }
+    // ── Regex fallback — complète UNIQUEMENT les champs manquants ────────────
+    // FIX : exclure les numéros fiscaux (IF, RC, CNSS, ICE, TP) des montants
+    if (!result.ice_client) {
+      // ICE client : 15 chiffres après "Client" ou "CE :"
+      result.ice_client = norm.match(/(?:client|CE)\s*[:\-]?\s*.*?(\d{15})/i)?.[1] ?? null;
+    }
+    if (!result.numero_facture) {
+      result.numero_facture = norm.match(/(?:n°\s*facture|facture\s*n°|numéro)\s*[:\-]?\s*([A-Z0-9\/\-]+)/i)?.[1] ?? null;
+    }
+    // Regex montants : uniquement si Groq n'a rien trouvé
+    if ((!result.montant_ttc || result.montant_ttc === 0) && method === "regex") {
+      // Cherche uniquement les montants MAD/DH explicites ou formats X XXX,XX
+      // Exclut les numéros fiscaux (IF, RC, CNSS, TP) qui sont < 10 chiffres sans virgule
+      const montantRegex = /\b(\d{1,3}(?:[\s.]\d{3})*[,\.]\d{2})\s*(?:MAD|DH|Dhs)?\b/g;
+      const amounts = [...norm.matchAll(montantRegex)]
+        .map(m => parseFloat(m[1].replace(/[\s.]/g, "").replace(",", ".")))
+        .filter(n => !isNaN(n) && n >= 10 && n < 10_000_000)
+        .sort((a, b) => b - a);
+      if (amounts[0]) {
+        result.montant_ttc = amounts[0];
+        result.montant_ht  = amounts[1] ?? Math.round(amounts[0] / 1.2 * 100) / 100;
+        result.montant_tva = Math.round((result.montant_ttc - result.montant_ht) * 100) / 100;
+      }
     }
     if (!result.lignes?.length && result.montant_ttc > 0) {
-      result.lignes = [{ designation: "Prestation (à préciser)", quantite: 1, prix_unitaire: result.montant_ht, taux_tva: 20 }];
+      result.lignes = [{
+        designation: "Prestation (à préciser)",
+        quantite: 1,
+        prix_unitaire: result.montant_ht,
+        taux_tva: 20,
+      }];
     }
 
-    // Résolution client
+    // ── Résolution client en base ─────────────────────────────────────────────
     let client_id: string | null = null;
     let client_action: "found" | "created" | "not_found" = "not_found";
     let client_trouve: any = null;
@@ -362,11 +463,15 @@ if (!result.date_echeance && result.date_facture) {
 
     if (nomClient || iceClient) {
       if (iceClient) {
-        const { data: byIce } = await supabase.from("clients").select("*").eq("dossier_id", data.dossier_id).eq("ice", iceClient).is("deleted_at", null).maybeSingle();
+        const { data: byIce } = await supabase.from("clients").select("*")
+          .eq("dossier_id", data.dossier_id).eq("ice", iceClient)
+          .is("deleted_at", null).maybeSingle();
         if (byIce) { client_id = byIce.id; client_action = "found"; client_trouve = byIce; }
       }
       if (!client_id && nomClient) {
-        const { data: byNom } = await supabase.from("clients").select("*").eq("dossier_id", data.dossier_id).ilike("nom", `%${nomClient.slice(0, 25)}%`).is("deleted_at", null).maybeSingle();
+        const { data: byNom } = await supabase.from("clients").select("*")
+          .eq("dossier_id", data.dossier_id).ilike("nom", `%${nomClient.slice(0, 25)}%`)
+          .is("deleted_at", null).maybeSingle();
         if (byNom) {
           const updates: any = {};
           if (!byNom.ice && iceClient) updates.ice = iceClient;
@@ -376,14 +481,24 @@ if (!result.date_echeance && result.date_facture) {
       }
       if (!client_id) {
         const { data: nouveau, error: ce } = await supabase.from("clients").insert({
-          dossier_id: data.dossier_id, nom: nomClient || `Client ICE ${iceClient}`,
-          ice: iceClient ?? null, if_fiscal: result.if_fiscal_client ?? null, rc: result.rc_client ?? null,
+          dossier_id: data.dossier_id,
+          nom: nomClient || `Client ICE ${iceClient}`,
+          ice: iceClient ?? null,
+          if_fiscal: result.if_fiscal_client ?? null,
+          rc: result.rc_client ?? null,
         }).select().single();
         if (nouveau) { client_id = nouveau.id; client_action = "created"; client_trouve = nouveau; }
         else console.log("[OCR] Erreur création client:", ce?.message);
       }
     }
 
-    console.log("[OCR] final:", { confidence, method, client_action, ttc: result.montant_ttc });
+    console.log("[OCR] final:", {
+      confidence, method, client_action,
+      client: result.client_nom_extrait,
+      ttc: result.montant_ttc,
+      type_facture: result.type_facture,
+      restant: result.montant_restant_du,
+    });
+
     return { result: { ...result, confidence, method, client_id, client_action, client_trouve } };
   });
