@@ -41,6 +41,7 @@ interface Transaction {
   necessite_remarque: boolean;
   message_pour_comptable: string | null;
   etape_rapprochement: string;
+  facture_id: string | null;
   suggestions: Array<{ nature: string; code_pcm: string; tiers: string | null; facture: string | null; confiance: number }>;
 }
 
@@ -79,6 +80,8 @@ const NATURES_OPERATION = [
 export const analyserTransactions = createServerFn({ method: "POST" })
   .inputValidator((input: unknown) => z.object({
     dossier_id: z.string().uuid(),
+    dossier_nom: z.string().default(""),
+    dossier_ice: z.string().default(""),
     transactions_brutes: z.array(z.any()),
     factures_client: z.array(z.any()),
     factures_fourn: z.array(z.any()),
@@ -90,40 +93,94 @@ export const analyserTransactions = createServerFn({ method: "POST" })
     const GROQ_KEY = process.env.GROQ_API_KEY;
     if (!GROQ_KEY) throw new Error("GROQ_API_KEY manquante");
 
-    const prompt = `Tu es expert-comptable marocain certifié (PCM/CGNC). Analyse ces transactions avec une logique de rapprochement avancée.
+    const facturesClientData = data.factures_client.map((f: any) => ({
+      id: f.id,
+      num: f.numero,
+      client: f.clients?.nom,
+      client_ice: f.clients?.ice,
+      ttc: Number(f.montant_ttc),
+      ht: Number(f.montant_ht),
+      tva: Number(f.montant_tva),
+      date_echeance: f.date_echeance || null,
+    }));
 
-FACTURES CLIENTS NON ENCAISSÉES:
-${JSON.stringify(data.factures_client.map((f: any) => ({ num: f.numero, client: f.clients?.nom, ttc: Number(f.montant_ttc), ht: Number(f.montant_ht), tva: Number(f.montant_tva), date_echeance: f.date_echeance || null })))}
+    const facturesFournData = data.factures_fourn.map((f: any) => ({
+      id: f.id,
+      num: f.numero,
+      fournisseur: f.fournisseur_nom,
+      ttc: Number(f.montant_ttc),
+      ht: Number(f.montant_ht),
+      tva: Number(f.montant_tva),
+      date_echeance: f.date_echeance || null,
+    }));
 
-FACTURES FOURNISSEURS NON PAYÉES:
-${JSON.stringify(data.factures_fourn.map((f: any) => ({ num: f.numero, fournisseur: f.fournisseur_nom, ttc: Number(f.montant_ttc), ht: Number(f.montant_ht), tva: Number(f.montant_tva), date_echeance: f.date_echeance || null })))}
+    const prompt = `Tu es expert-comptable marocain certifié (PCM/CGNC). Analyse ces transactions bancaires et effectue un rapprochement comptable précis.
+
+═══════════════════════════════════════════════════════
+CONTEXTE — SOCIÉTÉ DU DOSSIER
+═══════════════════════════════════════════════════════
+Société : "${data.dossier_nom}" (ICE: ${data.dossier_ice || "non renseigné"})
+Ce relevé bancaire appartient à cette société. Les CRÉDITS (entrées d'argent) sont des encaissements clients. Les DÉBITS (sorties) sont des paiements fournisseurs ou charges.
+
+═══════════════════════════════════════════════════════
+FACTURES CLIENTS NON ENCAISSÉES (à rapprocher avec crédits)
+═══════════════════════════════════════════════════════
+${JSON.stringify(facturesClientData)}
+
+═══════════════════════════════════════════════════════
+FACTURES FOURNISSEURS NON PAYÉES (à rapprocher avec débits)
+═══════════════════════════════════════════════════════
+${JSON.stringify(facturesFournData)}
 
 CLIENTS CONNUS: ${JSON.stringify(data.clients.map((c: any) => ({ nom: c.nom, ice: c.ice })))}
 FOURNISSEURS CONNUS: ${JSON.stringify(data.fournisseurs.map((f: any) => ({ nom: f.nom, ice: f.ice })))}
 
-${data.remarques ? `REMARQUES MÉMORISÉES (PRIORITÉ ABSOLUE - saisies par le comptable):\n${data.remarques}\n` : ""}
+${data.remarques ? `REMARQUES COMPTABLE (PRIORITÉ ABSOLUE):\n${data.remarques}\n` : ""}
 
-TRANSACTIONS À ANALYSER:
-${JSON.stringify(data.transactions_brutes.map((tx: any) => ({ ligne: tx.ligne, date_paiement: tx.date_operation, libelle: tx.nature_operation, debit: tx.montant_debit, credit: tx.montant_credit })))}
+═══════════════════════════════════════════════════════
+TRANSACTIONS À ANALYSER
+═══════════════════════════════════════════════════════
+${JSON.stringify(data.transactions_brutes.map((tx: any) => ({
+  ligne: tx.ligne,
+  date: tx.date_operation,
+  libelle: tx.nature_operation,
+  debit: tx.montant_debit,
+  credit: tx.montant_credit,
+})))}
 
-ALGORITHME DE RAPPROCHEMENT (dans cet ordre) :
-
-1. REMARQUES COMPTABLE → confiance 100% (priorité absolue)
-2. NUMÉRO FACTURE dans libellé → confiance 95%
-3. NOM TIERS dans libellé (tolérer abréviations) → confiance 85%
+═══════════════════════════════════════════════════════
+ALGORITHME DE RAPPROCHEMENT (ordre strict de priorité)
+═══════════════════════════════════════════════════════
+1. REMARQUES COMPTABLE → confiance 100%
+2. NUMÉRO FACTURE dans libellé (ex: "FAC2024-001", "F-123") → confiance 95%
+   → Cherche dans la liste des factures clients ET fournisseurs
+   → Si trouvé, retourner facture_id (l'id UUID de la facture correspondante)
+3. NOM TIERS dans libellé (tolérer abréviations, 3+ lettres communes) → confiance 85%
+   → Ex: "ATLAS" dans libellé → cherche client/fournisseur "ATLAS TRADING SARL"
+   → Si trouvé et montant compatible → retourner facture_id
 4. MONTANT TTC EXACT + DATE COHÉRENTE → confiance 80%
-   - Cherche facture dont montant_ttc = montant transaction (±0.01 MAD)
-   - Vérifie date_paiement ≤ date_echeance (ou date_facture + 30j par défaut)
-   - Propose même si nom absent du libellé (ex: "AGA" = montant match facture client X)
-5. MOTS-CLÉS PCM → confiance 75%
-   - CNSS/AMO→6174 | TVA/DGI→4456 | IAM/INWI/ORANGE→6132(TVA20%) | RETRAIT ESPECES→5161
-   - GASOIL→6122(TVA20%) | IMPORT/DOUANE→6146 | LOYER→6131 | PAIEMENT CB→6147
-6. INCONNU → necessite_remarque=true, message clair au comptable
+   → Facture avec montant_ttc = montant transaction (±1 MAD)
+   → Date transaction ≤ date_echeance facture (ou date_facture + 45j)
+   → Retourner facture_id si match trouvé
+5. MOTS-CLÉS PCM → confiance 70%
+   → CNSS/AMO → 6174 (tva 0%) | TVA/IR/IS/DGI → 4456 (tva 0%)
+   → IAM/INWI/ORANGE/TELECOM → 6132 (tva 20%) | LOYER/LOCATION → 6131 (tva 20%)
+   → GASOIL/CARBURANT → 6122 (tva 20%) | SALAIRE/VIREMENT SALAIRE → 6171 (tva 0%)
+   → EAU/ONEE/AMENAU → 6125 (tva 7%) | ELECTRICITE/ONEE → 6125 (tva 14%)
+   → ASSURANCE → 6161 (tva 0%) | FRAIS BANCAIRES/COMMISSION → 6347 (tva 10%)
+   → RETRAIT/GAB/ESPECES → 5161 (tva 0%) | INTERETS CREDITEURS → 7611 (tva 0%)
+   → IMPORT/DOUANE → 6146 (tva 0%) | ENTRETIEN/REPARATION → 6141 (tva 20%)
+6. DIRECTION D'ARGENT → confiance 60%
+   → credit (argent reçu) = encaissement_client → code 3421
+   → debit (argent sorti) = paiement_fournisseur → code 4411
+7. INCONNU → necessite_remarque=true avec message clair au comptable
 
-RÈGLES TVA MAROC: Télécom 20%, Eau 7%, Elec 14%, Loyer 20%, Gasoil 20%, Transport 14%, Frais banque 10%, CNSS/DGI 0%
+RÈGLE CRITIQUE DÉBIT/CRÉDIT:
+- transaction.credit > 0 → argent ENTRANT = encaissement client (compte 3421)
+- transaction.debit > 0 → argent SORTANT = paiement (fournisseur, charges, etc.)
 
 Réponds UNIQUEMENT avec ce JSON valide:
-{"analyses":[{"ligne":number,"nature_principale":"encaissement_client|paiement_fournisseur|salaires|cnss_amo|tva_dgi|loyers|eau_electricite|telecom|gasoil|assurance|entretien|frais_bancaires|frais_representation|frais_douane|retrait_especes|interets_crediteurs|virement_interne|autre","code_pcm":"string","tiers_nom":"string|null","tiers_type":"client|fournisseur|employe|etat|banque|autre","facture_num":"string|null","montant_ht":number|null,"montant_tva":number|null,"taux_tva":0|7|10|14|20,"confiance":number,"etape_rapprochement":"remarques|numero_facture|nom_tiers|montant_date|mots_cles|inconnu","alerte":"string|null","necessite_remarque":boolean,"message_pour_comptable":"string|null","suggestions":[{"nature":"string","code_pcm":"string","tiers":"string|null","facture":"string|null","confiance":number}]}]}`;
+{"analyses":[{"ligne":number,"nature_principale":"encaissement_client|paiement_fournisseur|salaires|cnss_amo|tva_dgi|loyers|eau_electricite|telecom|gasoil|assurance|entretien|frais_bancaires|frais_representation|frais_douane|retrait_especes|interets_crediteurs|virement_interne|autre","code_pcm":"string","tiers_nom":"string|null","tiers_type":"client|fournisseur|employe|etat|banque|autre","facture_num":"string|null","facture_id":"string|null","montant_ht":number|null,"montant_tva":number|null,"taux_tva":0|7|10|14|20,"confiance":number,"etape_rapprochement":"remarques|numero_facture|nom_tiers|montant_date|mots_cles|direction|inconnu","alerte":"string|null","necessite_remarque":boolean,"message_pour_comptable":"string|null","suggestions":[{"nature":"string","code_pcm":"string","tiers":"string|null","facture":"string|null","confiance":number}]}]}`;
 
     const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
       method: "POST",
@@ -167,6 +224,7 @@ function RelEveScanner() {
   const [facturesFourn, setFacturesFourn] = useState<any[]>([]);
   const [fournisseurs, setFournisseurs] = useState<any[]>([]);
   const [clients, setClients] = useState<any[]>([]);
+  const [dossier, setDossier] = useState<{ nom_societe: string; ice: string | null } | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -175,74 +233,159 @@ function RelEveScanner() {
       (supabase as any).from("factures_fournisseurs").select("id,numero,montant_ht,montant_ttc,montant_tva,date_facture,date_echeance,fournisseur_nom,fournisseur_id").eq("dossier_id", dossierId).neq("statut_paiement", "payee"),
       (supabase as any).from("fournisseurs").select("id,nom,ice").eq("dossier_id", dossierId),
       supabase.from("clients").select("id,nom,ice").eq("dossier_id", dossierId),
-    ]).then(([{ data: f }, { data: ff }, { data: fo }, { data: cl }]) => {
+      supabase.from("dossiers").select("nom_societe,ice").eq("id", dossierId).single(),
+    ]).then(([{ data: f }, { data: ff }, { data: fo }, { data: cl }, { data: dos }]) => {
       setFactures(f ?? []);
       setFacturesFourn(ff ?? []);
       setFournisseurs(fo ?? []);
       setClients(cl ?? []);
+      setDossier(dos ?? null);
     });
   }, [dossierId]);
 
   const parserTransactions = (text: string): any[] => {
     const txs: any[] = [];
-    const lines = text.split(/\n/).map((l: string) => l.trim()).filter((l: string) => l.length > 3);
-    const EXCL = ["solde a reporter", "ancien solde", "total des", "banque populaire", "agence", "adresse", "extrait de compte", "releve d", "code banque", "date oper", "montant", "page n", "www.", "sa au capital"];
-    const BP_DATE = /^(\d{2})\s+(\d{2})\s+(\d{4})\s+(\d{2})\s+(\d{2})\s+(\d{4})\s+/;
-    const CIH_DATE = /^(\d{2})[\/\-](\d{2})\d?\s+\d?\s*\d{0,2}[\/\-]\d{2}/;
-    const ATT_DATE = /^([0-9A-Z]{5,7})\s+(\d{2}\s+\d{2})\s+/;
     const year = new Date().getFullYear();
-    const merged: string[] = [];
+
+    // Mots à exclure (en-têtes, pieds de page, totaux)
+    const EXCL = [
+      "solde a reporter", "ancien solde", "solde depart", "nouveau solde", "solde final",
+      "total des", "total mouvements", "banque populaire", "attijariwafa", "cih bank", "bmci",
+      "agence", "adresse", "extrait de compte", "releve de compte", "releve bancaire",
+      "code banque", "code agence", "date oper", "date valeur", "libelle", "debit", "credit",
+      "montant", "page n", "page:", "www.", "sa au capital", "ice :", "rc :", "if :",
+      "numéro de compte", "numero de compte", "rib :", "rib:", "titulaire",
+    ];
+
+    // Mots-clés qui signalent un CRÉDIT (argent entrant)
+    const CREDIT_KEYWORDS = [
+      "VIRT RECU", "VIREMENT RECU", "VERSEMENT ESPECE", "VERSEMENT ESP",
+      "REMISE CHEQUE", "REMISE CHQ", "RECU", "ENCAISSEMENT", "RETROCESSION",
+      "INTERETS CREDITEURS", "INTERETS CREDIT", "AVOIR", "REMBOURSEMENT",
+      "DEPOT", "RECOUVREMENT", "CREDIT VIREMENT", "CREDIT ESPECES",
+      "AVIS DE CREDIT", "TRANSFERT RECU",
+    ];
+
+    const lines = text.split(/\n/).map((l: string) => l.trim()).filter((l: string) => l.length > 5);
+
+    // ─── Stratégie 1 : lignes avec date DD/MM ou DD/MM/YYYY ou DD MM YYYY ──────
+    // Couvre BP (deux dates), CIH (DD/MM), ATW (référence + DD MM), BMCI (DD/MM/YYYY)
+    const DATE_PATTERNS = [
+      // BP: "15 03 2024 17 03 2024 VIREMENT ..."
+      /^(\d{2})\s+(\d{2})\s+(\d{4})\s+(\d{2})\s+(\d{2})\s+(\d{4})\s+(.*)/,
+      // YYYY-MM-DD ou YYYY/MM/DD
+      /^(\d{4})[-\/](\d{2})[-\/](\d{2})\s+(.*)/,
+      // DD/MM/YYYY ou DD-MM-YYYY
+      /^(\d{2})[\/\-](\d{2})[\/\-](\d{4})\s+(.*)/,
+      // DD/MM ou DD-MM (CIH, sans année)
+      /^(\d{2})[\/\-](\d{2})\s+(.*)/,
+      // ATW: référence alphanumérique + DD MM  (ex: "VIR0001 15 03 ...")
+      /^[A-Z0-9]{4,12}\s+(\d{2})\s+(\d{2})\s+(.*)/,
+    ];
+
+    const parsed: Array<{ date: string; libelle_raw: string; line: string }> = [];
 
     for (const line of lines) {
       const low = line.toLowerCase();
       if (EXCL.some(e => low.includes(e))) continue;
-      if (/^[\u0600-\u06FF\s,\.]+$/.test(line)) continue;
-      if (BP_DATE.test(line) || CIH_DATE.test(line) || ATT_DATE.test(line)) {
-        merged.push(line);
-      } else if (merged.length > 0) {
-        if (/^[\d]+$/.test(line.trim()) || /^,\d+/.test(line.trim())) {
-          merged[merged.length - 1] += line.trim();
-        } else {
-          merged[merged.length - 1] += " " + line;
+      if (/^[\u0600-\u06FF\s,\.]+$/.test(line)) continue; // lignes arabes
+      if (/^\*+$/.test(line) || /^-{3,}$/.test(line)) continue; // séparateurs
+
+      let date = "";
+      let libelle_raw = line;
+
+      // Essai BP (2 dates complètes)
+      const mBP = line.match(/^(\d{2})\s+(\d{2})\s+(\d{4})\s+(\d{2})\s+(\d{2})\s+(\d{4})\s+(.*)/);
+      if (mBP) { date = `${mBP[1]}/${mBP[2]}/${mBP[3]}`; libelle_raw = mBP[7]; }
+
+      // Essai YYYY-MM-DD
+      if (!date) {
+        const mISO = line.match(/^(\d{4})[-\/](\d{2})[-\/](\d{2})\s+(.*)/);
+        if (mISO) { date = `${mISO[3]}/${mISO[2]}/${mISO[1]}`; libelle_raw = mISO[4]; }
+      }
+
+      // Essai DD/MM/YYYY ou DD-MM-YYYY
+      if (!date) {
+        const mFull = line.match(/^(\d{2})[\/\-](\d{2})[\/\-](\d{4})\s+(.*)/);
+        if (mFull) { date = `${mFull[1]}/${mFull[2]}/${mFull[3]}`; libelle_raw = mFull[4]; }
+      }
+
+      // Essai DD/MM (CIH sans année)
+      if (!date) {
+        const mShort = line.match(/^(\d{2})[\/\-](\d{2})\s+(.*)/);
+        if (mShort && Number(mShort[1]) <= 31 && Number(mShort[2]) <= 12) {
+          date = `${mShort[1]}/${mShort[2]}/${year}`; libelle_raw = mShort[3];
         }
       }
+
+      // Essai ATW (code ref + DD MM)
+      if (!date) {
+        const mATW = line.match(/^[A-Z0-9]{4,12}\s+(\d{2})\s+(\d{2})\s+(.*)/);
+        if (mATW && Number(mATW[1]) <= 31 && Number(mATW[2]) <= 12) {
+          date = `${mATW[1]}/${mATW[2]}/${year}`; libelle_raw = mATW[3];
+        }
+      }
+
+      // Si aucune date trouvée mais on a une ligne précédente → continuation
+      if (!date) {
+        if (parsed.length > 0) {
+          const hasAmount = /\d{1,3}(?:\s\d{3})*[,\.]\d{2}/.test(line);
+          if (!hasAmount) {
+            parsed[parsed.length - 1].libelle_raw += " " + line;
+          }
+        }
+        continue;
+      }
+
+      parsed.push({ date, libelle_raw, line });
     }
 
-    let ligne = 1;
-    for (const line of merged) {
-      const fixed = line.replace(/(\d+,\d)\s+(\d)\b/g, "$1$2");
-      let amounts = [...fixed.matchAll(/\b(\d{1,3}(?:\s\d{3})*),(\d{2})\b/g)].map(m => parseFloat(m[1].replace(/\s/g, "") + "." + m[2]));
-      if (!amounts.length) {
-        amounts = [...fixed.matchAll(/(?<![,\d])(\d{2,7}),(\d{2})(?!\d)/g)].map(m => parseFloat(m[1] + "." + m[2]));
-      }
-      if (!amounts.length || amounts[amounts.length - 1] <= 0) continue;
-      const montant = amounts[amounts.length - 1];
-      const up = line.toUpperCase();
-      const isCredit = up.includes("RECU") || up.includes("REMISE CHEQUE") || up.includes("VERSEMENT ESPECE") || up.includes("INTERETS CREDIT") || up.includes("VIRT RECU");
-      let date = "";
-      const bp = line.match(/^(\d{2})\s+(\d{2})\s+(\d{4})/);
-      const cih = line.match(/^(\d{2})[\/\-](\d{2})/);
-      const att = line.match(/^[0-9A-Z]{5,7}\s+(\d{2})\s+(\d{2})/);
-      if (bp) date = `${bp[1]}/${bp[2]}/${bp[3]}`;
-      else if (cih) date = `${cih[1]}/${cih[2]}/${year}`;
-      else if (att) date = `${att[1]}/${att[2]}/${year}`;
-      if (!date) continue;
+    // ─── Extraction montant + débit/crédit ────────────────────────────────────
+    let ligneNum = 1;
+    for (const { date, libelle_raw, line } of parsed) {
+      // Normalise les montants collés (ex: "1 234,56" ou "1234,56" ou "1.234,56")
+      const fixed = libelle_raw.replace(/(\d+,\d)\s+(\d)\b/g, "$1$2");
+
+      // Extraction de tous les montants valides (format marocain: X XXX,XX ou X.XXX,XX)
+      const amountMatches = [
+        ...(fixed.matchAll(/\b(\d{1,3}(?:[\s.]\d{3})*),(\d{2})\b/g)),
+        ...(fixed.matchAll(/(?<![,\d])(\d{2,8}),(\d{2})(?!\d)/g)),
+      ];
+      const amounts = amountMatches
+        .map(m => parseFloat(m[1].replace(/[\s.]/g, "") + "." + m[2]))
+        .filter(n => !isNaN(n) && n >= 1 && n < 50_000_000);
+
+      if (!amounts.length) continue;
+
+      // Le dernier montant est généralement le solde ou le montant principal
+      // Prendre le plus grand montant non-solde (souvent avant-dernier ou dernier)
+      const montant = amounts[amounts.length - 1] > 0 ? amounts[amounts.length - 1] : amounts[0];
+      if (!montant || montant <= 0) continue;
+
+      // Nettoyage du libellé (enlever dates et montants)
       let libelle = fixed
-        .replace(/^\d{2}[\/\-]?\d{2}[\/\-]?\d{0,4}\s+\d{0,2}[\/\-]?\d{0,2}[\/\-]?\d{0,4}\s+/, "")
-        .replace(/^[0-9A-Z]{5,7}\s+\d{2}\s+\d{2}\s+/, "")
-        .replace(/\b\d{1,3}(?:\s\d{3})*,\d{2}\b/g, "")
-        .replace(/(?<![,\d])\d{2,7},\d{2}(?!\d)/g, "")
-        .replace(/\s{2,}/g, " ").trim().slice(0, 100);
+        .replace(/\b\d{1,3}(?:[\s.]\d{3})*,\d{2}\b/g, "")
+        .replace(/(?<![,\d])\d{2,8},\d{2}(?!\d)/g, "")
+        .replace(/^\d{2}[\/\-\s]\d{2}([\/\-\s]\d{2,4})?\s*/g, "")
+        .replace(/\s{2,}/g, " ").trim().slice(0, 120);
+
+      if (!libelle || libelle.length < 2) libelle = "Transaction bancaire";
+
+      // Détection CRÉDIT (argent entrant) par mots-clés
+      const up = (line + " " + libelle_raw).toUpperCase();
+      const isCredit = CREDIT_KEYWORDS.some(kw => up.includes(kw));
+
       txs.push({
-        ligne: ligne++,
+        ligne: ligneNum++,
         date_operation: date,
         date_valeur: date,
         reference: "",
-        nature_operation: libelle || "Transaction",
+        nature_operation: libelle,
         montant_debit: isCredit ? null : montant,
         montant_credit: isCredit ? montant : null,
       });
     }
+
     return txs;
   };
 
@@ -283,6 +426,8 @@ function RelEveScanner() {
       const result = await analyserTransactions({
         data: {
           dossier_id: dossierId,
+          dossier_nom: dossier?.nom_societe ?? "",
+          dossier_ice: dossier?.ice ?? "",
           transactions_brutes: txBrutes,
           factures_client: factures,
           factures_fourn: facturesFourn,
@@ -318,6 +463,7 @@ function RelEveScanner() {
           necessite_remarque: a.necessite_remarque ?? false,
           message_pour_comptable: a.message_pour_comptable ?? null,
           etape_rapprochement: a.etape_rapprochement ?? 'inconnu',
+          facture_id: a.facture_id ?? null,
           suggestions: a.suggestions ?? [],
         };
       });
@@ -371,28 +517,68 @@ function RelEveScanner() {
     setSaving(true);
     try {
       const ecritures: any[] = [];
+      const facturesClientPayees: string[] = [];
+      const facturesFournPayees: string[] = [];
+
       for (const tx of transactions.filter(t => t.valide)) {
-        const date = tx.date_operation.includes("/")
-          ? tx.date_operation.split("/").reverse().join("-")
+        const dateParts = tx.date_operation.includes("/")
+          ? tx.date_operation.split("/")
+          : tx.date_operation.split("-");
+        const date = dateParts.length === 3
+          ? (dateParts[2].length === 4
+            ? `${dateParts[2]}-${dateParts[1]}-${dateParts[0]}`
+            : tx.date_operation)
           : tx.date_operation;
+
         const montant = tx.montant_credit ?? tx.montant_debit ?? 0;
         const libelle = (tx.debiteur_crediteur
           ? `${tx.nature_operation} - ${tx.debiteur_crediteur}`
           : tx.nature_operation).slice(0, 100);
         const ht  = tx.montant_ht  ?? montant;
         const tva = tx.montant_tva ?? 0;
+
         // Banque 5141
         ecritures.push({ dossier_id: dossierId, journal_code: "BQ", compte_numero: "5141", date_ecriture: date, libelle, debit: tx.montant_credit ? montant : 0, credit: tx.montant_debit ? montant : 0, reference_piece: tx.document_reference || tx.reference, valide: true });
+
         // Contre-écriture avec TVA
         if (tva > 0 && tx.montant_debit) {
-          ecritures.push({ dossier_id: dossierId, journal_code: "BQ", compte_numero: tx.code_comptable, date_ecriture: date, libelle, debit: ht,  credit: 0, reference_piece: tx.document_reference, valide: true });
-          ecritures.push({ dossier_id: dossierId, journal_code: "BQ", compte_numero: "34552",           date_ecriture: date, libelle: `TVA ${libelle.slice(0, 50)}`, debit: tva, credit: 0, reference_piece: tx.document_reference, valide: true });
+          ecritures.push({ dossier_id: dossierId, journal_code: "BQ", compte_numero: tx.code_comptable, date_ecriture: date, libelle, debit: ht, credit: 0, reference_piece: tx.document_reference, valide: true });
+          ecritures.push({ dossier_id: dossierId, journal_code: "BQ", compte_numero: "34552", date_ecriture: date, libelle: `TVA ${libelle.slice(0, 50)}`, debit: tva, credit: 0, reference_piece: tx.document_reference, valide: true });
         } else {
           ecritures.push({ dossier_id: dossierId, journal_code: "BQ", compte_numero: tx.code_comptable, date_ecriture: date, libelle, debit: tx.montant_debit ? 0 : ht, credit: tx.montant_credit ? 0 : ht, reference_piece: tx.document_reference, valide: true });
         }
+
+        // Rapprochement facture — marquer comme payée
+        if (tx.facture_id) {
+          if (tx.nature_confirmee === "encaissement_client" && tx.montant_credit) {
+            facturesClientPayees.push(tx.facture_id);
+          } else if (tx.nature_confirmee === "paiement_fournisseur" && tx.montant_debit) {
+            facturesFournPayees.push(tx.facture_id);
+          }
+        }
       }
+
       await supabase.from("ecritures_comptables").insert(ecritures);
-      toast.success(`${transactions.filter(t => t.valide).length} transactions comptabilisées`);
+
+      // Marquer les factures clients rapprochées comme payées
+      if (facturesClientPayees.length > 0) {
+        await supabase.from("factures")
+          .update({ statut_paiement: "payee", date_paiement: new Date().toISOString().slice(0, 10) })
+          .in("id", facturesClientPayees);
+      }
+
+      // Marquer les factures fournisseurs rapprochées comme payées
+      if (facturesFournPayees.length > 0) {
+        await (supabase as any).from("factures_fournisseurs")
+          .update({ statut_paiement: "payee", date_paiement: new Date().toISOString().slice(0, 10) })
+          .in("id", facturesFournPayees);
+      }
+
+      const nbPayees = facturesClientPayees.length + facturesFournPayees.length;
+      toast.success(
+        `${transactions.filter(t => t.valide).length} transactions comptabilisées` +
+        (nbPayees > 0 ? ` — ${nbPayees} facture(s) marquée(s) payée(s)` : "")
+      );
       setStep("done");
     } catch (e: any) {
       toast.error(e.message);

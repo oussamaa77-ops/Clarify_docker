@@ -261,6 +261,10 @@ export const ocrFacture = createServerFn({ method: "POST" })
     const text = data.extracted_text ?? "";
     const norm = text.replace(/\r\n/g, "\n").replace(/\s+/g, " ");
 
+    const { data: dossier } = await supabase.from("dossiers").select("nom_societe,ice").eq("id", data.dossier_id).single();
+    const dossierNom = (dossier?.nom_societe ?? "").trim();
+    const dossierIce = (dossier?.ice ?? "").trim();
+
     let result: any = {
       client_nom_extrait: "", ice_client: null, if_fiscal_client: null, rc_client: null,
       numero_facture: null, date_facture: null, date_echeance: null,
@@ -278,55 +282,91 @@ export const ocrFacture = createServerFn({ method: "POST" })
 
     if (groqKey) {
       try {
-        // ── PROMPT FINAL — générique, sans exemple spécifique ────────────────
-        const prompt = `Tu es un expert-comptable et analyste de documents financiers. Tu dois extraire les données d'une facture avec une précision maximale.
+        const prompt = `Tu es un expert-comptable et analyste de documents financiers marocains. Tu dois extraire les données d'une facture avec une précision maximale.
 
-RÈGLE FONDAMENTALE — IDENTIFIER LES PARTIES :
+═══════════════════════════════════════════════════════
+CONTEXTE CRITIQUE — DOSSIER EN COURS DE TRAITEMENT
+═══════════════════════════════════════════════════════
+La société dont on gère la comptabilité (le dossier client du cabinet) est :
+  • Nom    : "${dossierNom}"
+  • ICE    : "${dossierIce || "non renseigné"}"
+
+Tu DOIS comparer l'émetteur et le destinataire de la facture scannée avec cette société pour déterminer le sens (voir champ sens_facture ci-dessous).
+
+═══════════════════════════════════════════════════════
+RÈGLE 1 — IDENTIFIER LES PARTIES
+═══════════════════════════════════════════════════════
 Une facture a TOUJOURS deux parties :
+
 1. L'ÉMETTEUR (vendeur) = celui qui ÉMET la facture et demande le paiement
    → Identifié par : son en-tête, ses coordonnées fiscales (RC, IF, ICE, CNSS, TP), son logo
-   → Peut être n'importe où (haut, bas, gauche, droite)
-   → NE JAMAIS mettre l'émetteur dans client_nom
+   → emetteur_nom = son nom de société, emetteur_ice = son ICE
 
-2. LE CLIENT (acheteur) = celui qui REÇOIT la facture et doit PAYER
-   → Identifié UNIQUEMENT par les mots-clés : "Client :", "Facturer à :", "Bill to :",
-     "Destinataire :", "Adressé à :", "À l'attention de :", "Envoyé à :", bloc "CLIENT"
-   → Peut être n'importe où sur la facture
-   → client_nom = UNIQUEMENT le nom du client, jamais l'émetteur
+2. LE CLIENT / DESTINATAIRE (acheteur) = celui qui REÇOIT la facture et doit PAYER
+   → Identifié par les mots-clés : "Client :", "Facturer à :", "Bill to :", "Destinataire :",
+     "Adressé à :", "À l'attention de :", bloc "CLIENT", "Vendu à :"
+   → client_nom = UNIQUEMENT le nom du client, JAMAIS le nom de l'émetteur
 
 RÈGLE CRITIQUE : Ne JAMAIS confondre l'émetteur avec le client.
-La présence des coordonnées fiscales (RC, IF, ICE, CNSS, TP) identifie l'émetteur, pas le client.
 
-EXTRACTION ICE :
+═══════════════════════════════════════════════════════
+RÈGLE 2 — DÉTERMINER LE SENS DE LA FACTURE (OBLIGATOIRE)
+═══════════════════════════════════════════════════════
+Compare les noms et ICE de la facture avec la société du dossier ("${dossierNom}", ICE: "${dossierIce}").
+
+→ Si la société du dossier est l'ÉMETTEUR (vendeur) → sens_facture = "client"
+  (c'est une facture de VENTE que notre société a émise à un de ses clients)
+
+→ Si la société du dossier est le CLIENT / DESTINATAIRE (acheteur) → sens_facture = "fournisseur"
+  (c'est une facture d'ACHAT reçue d'un fournisseur externe)
+
+→ Si impossible à déterminer avec certitude → sens_facture = "inconnu"
+
+Règle de comparaison : tolérer les abréviations (ex: "SARL" vs "S.A.R.L"), majuscules/minuscules,
+accents, formes courtes du nom. Comparer aussi l'ICE si disponible (15 chiffres exacts).
+
+Exemple :
+  - Dossier = "ATLAS TRADING SARL", facture émise par "ATLAS TRADING" → sens = "client"
+  - Dossier = "ATLAS TRADING SARL", facture adressée à "ATLAS TRADING" → sens = "fournisseur"
+
+═══════════════════════════════════════════════════════
+RÈGLE 3 — EXTRACTION ICE
+═══════════════════════════════════════════════════════
 - Format ICE marocain : exactement 15 chiffres consécutifs
-- L'ICE qui suit "Client :" ou "CE :" dans le bloc client = client_ice
-- L'ICE dans l'en-tête ou pied de page de l'émetteur = emetteur_ice uniquement
+- L'ICE dans le bloc émetteur = emetteur_ice
+- L'ICE dans le bloc client/destinataire = client_ice
 
-DÉTECTION TYPE DE FACTURE :
-- "acompte" → présence des mots : acompte, avance, versement, arrhes, provision, reliquat, solde restant dû
+═══════════════════════════════════════════════════════
+RÈGLE 4 — TYPE DE FACTURE
+═══════════════════════════════════════════════════════
+- "acompte" → mots : acompte, avance, versement, arrhes, provision, reliquat, solde restant dû
 - "solde"   → facture finale après acomptes, solde de tout compte
 - "avoir"   → avoir, note de crédit, remboursement, annulation
-- "standard"→ facture normale sans ces mots
+- "standard"→ facture normale
 
-RÈGLES MONTANTS — FACTURE D'ACOMPTE :
-La facture peut contenir PLUSIEURS montants :
+═══════════════════════════════════════════════════════
+RÈGLE 5 — MONTANTS FACTURE D'ACOMPTE
+═══════════════════════════════════════════════════════
 - Montant COMMANDE TOTALE → montant_commande_total_ttc (ne pas mettre dans montant_ttc)
-- Montant de CET ACOMPTE → montant_ttc (cherche "Total TTC" dans le récapitulatif)
-- RELIQUAT restant → montant_restant_du (cherche "reliquat", "reste à payer", "solde restant")
-→ montant_ttc = UNIQUEMENT le montant de cette facture, jamais le total commande
+- Montant de CET ACOMPTE  → montant_ttc
+- RELIQUAT restant        → montant_restant_du
+→ montant_ttc = UNIQUEMENT le montant de cette facture
 
-NORMALISATION LIGNES :
-- Toujours retourner : description, quantite, prix_unitaire_ht, total_ht, taux_tva
+═══════════════════════════════════════════════════════
+RÈGLE 6 — LIGNES
+═══════════════════════════════════════════════════════
+- Retourner : description, quantite, prix_unitaire_ht, total_ht, taux_tva
 - Si prix_unitaire_ht absent : calculer total_ht / quantite
 - Taux TVA par défaut au Maroc : 20
 
 Réponds UNIQUEMENT avec ce JSON valide, sans markdown, sans backticks :
 {
+  "sens_facture": "client|fournisseur|inconnu",
+  "emetteur_nom": "nom de la société émettrice",
+  "emetteur_ice": "ICE émetteur (15 chiffres) ou null",
   "client_nom": "nom exact du CLIENT qui paie (jamais l'émetteur)",
   "client_ice": "exactement 15 chiffres ou null",
   "client_adresse": "adresse du client ou null",
-  "emetteur_nom": "nom de la société émettrice",
-  "emetteur_ice": "ICE émetteur ou null",
   "numero": "numéro de facture ou null",
   "date": "YYYY-MM-DD ou null",
   "date_echeance": "YYYY-MM-DD ou null",
@@ -383,6 +423,9 @@ Réponds UNIQUEMENT avec ce JSON valide, sans markdown, sans backticks :
             const ai = JSON.parse(matchJson[0]);
             result = {
               ...result,
+              sens_facture:               ai.sens_facture                        ?? "inconnu",
+              emetteur_nom:               ai.emetteur_nom                        ?? null,
+              emetteur_ice:               ai.emetteur_ice                        ?? null,
               client_nom_extrait:         ai.client_nom                          ?? "",
               ice_client:                 ai.client_ice                          ?? null,
               numero_facture:             ai.numero                              ?? null,
@@ -494,6 +537,8 @@ Réponds UNIQUEMENT avec ce JSON valide, sans markdown, sans backticks :
 
     console.log("[OCR] final:", {
       confidence, method, client_action,
+      sens_facture: result.sens_facture,
+      emetteur: result.emetteur_nom,
       client: result.client_nom_extrait,
       ttc: result.montant_ttc,
       type_facture: result.type_facture,
