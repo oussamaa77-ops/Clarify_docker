@@ -132,6 +132,7 @@ function FacturesPage() {
           fullText += content.items.map((item: any) => item.str).join(" ") + "\\n";
         }
         extractedText = fullText.trim();
+        console.log("[OCR TEXT]", extractedText.slice(0, 500))
       } else if (isExcel) {
         const XLSX = await import("xlsx");
         const arrayBuffer = await file.arrayBuffer();
@@ -220,6 +221,7 @@ function FacturesPage() {
     setLignes([{ designation: "", quantite: 1, prix_unitaire: 0, taux_tva: 20 }]);
     setClientId(""); setNumero(""); setDateE("");
     load();
+    
   };
 
   const handleGenXml = async (f: Facture) => {

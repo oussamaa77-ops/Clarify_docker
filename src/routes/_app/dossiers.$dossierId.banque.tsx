@@ -51,80 +51,140 @@ export const analyserReleveIA = createServerFn({ method: "POST" })
     remarques: z.string().optional(),
   }).parse(input))
   .handler(async ({ data }) => {
-    const geminiKey = process.env.GEMINI_API_KEY;
-    const groqKey   = process.env.GROQ_API_KEY;
-
-    const prompt = `Tu es expert-comptable marocain certifié (PCM/CGNC). Analyse ces transactions bancaires.
-
+    const groqKey = process.env.GROQ_API_KEY;
+    if (!groqKey) throw new Error("GROQ_API_KEY manquante");
+ 
+    const prompt = `Tu es expert-comptable marocain certifié (PCM/CGNC). Analyse ces transactions bancaires et retourne un JSON valide.
+ 
 SOCIÉTÉ DU DOSSIER: "${data.dossier_nom}" (ICE: ${data.dossier_ice || "non renseigné"})
-CRÉDITS = encaissements. DÉBITS = paiements ou charges.
-
-FACTURES CLIENTS NON ENCAISSÉES:
-${JSON.stringify(data.factures_client.map((f: any) => ({ id: f.id, num: f.numero, client: f.clients?.nom, ttc: Number(f.montant_ttc), ht: Number(f.montant_ht), echeance: f.date_echeance })))}
-
-FACTURES FOURNISSEURS NON PAYÉES:
-${JSON.stringify(data.factures_fourn.map((f: any) => ({ id: f.id, num: f.numero, fournisseur: f.fournisseur_nom, ttc: Number(f.montant_ttc), ht: Number(f.montant_ht), echeance: f.date_echeance })))}
-
-CLIENTS: ${JSON.stringify(data.clients.map((c: any) => ({ nom: c.nom, ice: c.ice })))}
-FOURNISSEURS: ${JSON.stringify(data.fournisseurs.map((f: any) => ({ nom: f.nom, ice: f.ice })))}
-${data.remarques ? `REMARQUES (PRIORITÉ ABSOLUE):\n${data.remarques}\n` : ""}
-
+CRÉDITS = argent entrant (encaissements clients). DÉBITS = argent sortant (paiements, charges).
+ 
+FACTURES CLIENTS NON ENCAISSÉES (à rapprocher avec les CRÉDITS):
+${JSON.stringify(data.factures_client.map((f: any) => ({
+  id: f.id,
+  num: f.numero,
+  client: f.clients?.nom,
+  ttc: Number(f.montant_ttc),
+  ht: Number(f.montant_ht),
+  echeance: f.date_echeance,
+})))}
+ 
+FACTURES FOURNISSEURS NON PAYÉES (à rapprocher avec les DÉBITS):
+${JSON.stringify(data.factures_fourn.map((f: any) => ({
+  id: f.id,
+  num: f.numero,
+  fournisseur: f.fournisseur_nom,
+  ttc: Number(f.montant_ttc),
+  ht: Number(f.montant_ht),
+  echeance: f.date_echeance,
+})))}
+ 
+CLIENTS CONNUS: ${JSON.stringify(data.clients.map((c: any) => ({ nom: c.nom, ice: c.ice })))}
+FOURNISSEURS CONNUS: ${JSON.stringify(data.fournisseurs.map((f: any) => ({ nom: f.nom, ice: f.ice })))}
+${data.remarques ? `\nREMARQUES COMPTABLE (PRIORITÉ ABSOLUE — appliquer avant tout):\n${data.remarques}\n` : ""}
+ 
 TRANSACTIONS À ANALYSER:
-${JSON.stringify(data.transactions_brutes.map((tx: any, i: number) => ({ i, date: tx.date_operation, libelle: tx.libelle, debit: tx.montant_debit, credit: tx.montant_credit })))}
-
-ALGORITHME (ordre strict):
-1. REMARQUES COMPTABLE → confiance 100%
-2. NUMÉRO FACTURE dans libellé → confiance 95%, retourner facture_id UUID
+${JSON.stringify(data.transactions_brutes.map((tx: any, i: number) => ({
+  i,
+  date: tx.date_operation,
+  libelle: tx.libelle,
+  debit: tx.montant_debit ?? null,
+  credit: tx.montant_credit ?? null,
+})))}
+ 
+ALGORITHME DE RAPPROCHEMENT (appliquer dans cet ordre strict, s'arrêter au premier match):
+1. REMARQUES → confiance 100%
+2. NUMÉRO FACTURE dans libellé (ex: FA-001, F2026-05, FAC/2026/001) → confiance 95%
+   → Chercher dans factures clients ET fournisseurs, retourner le champ "id" UUID exact
 3. NOM TIERS dans libellé (3+ lettres communes, tolérer abréviations) → confiance 85%
-4. MONTANT TTC EXACT ±1 MAD + date ≤ echeance+15j → confiance 80%, retourner facture_id
+   → Ex: "ATLAS" dans libellé → client/fournisseur "ATLAS TRADING SARL"
+   → Si montant compatible avec une facture de ce tiers → retourner facture_id
+4. MONTANT TTC EXACT ±1 MAD + date transaction ≤ date_echeance + 15 jours → confiance 80%
+   → Retourner le facture_id correspondant
 5. MOTS-CLÉS PCM marocain:
-   CNSS|AMO→6174(0%) | TVA|DGI|IR|IS→4456(0%) | SALAIRE→6171(0%)
-   IAM|INWI|ORANGE|TELECOM→6132(20%) | LOYER|LOCATION→6131(20%)
-   GASOIL|CARBURANT→6122(20%) | EAU|ONEE|AMENAU→6125(7%)
-   ASSURANCE→6161(0%) | COMMISSION|FRAIS BANC→6347(10%)
-   RETRAIT|GAB|ESPECES→5161(0%) | IMPORT|DOUANE→6146(0%)
-   RESTAURANT|LOUNG|CAFE→6147(0%) | ENTRETIEN|REPARATION→6141(20%)
-   TRANSPORT|DEPLACEMENT→6145(0%) → confiance 75%
-6. DIRECTION: credit→encaissement_client/3421, debit→paiement_fournisseur/4411 → confiance 60%
-7. INCONNU → alerte avec message pour comptable
-
-Réponds UNIQUEMENT avec ce JSON:
-{"analyses":[{"i":0,"categorie":"encaissement_client|paiement_fournisseur|salaires|cnss_amo|tva_dgi|loyers|eau_electricite|telecom|gasoil|assurance|entretien|frais_bancaires|frais_representation|frais_douane|retrait_especes|interets_crediteurs|autre","code_pcm":"string","tiers_nom":"string|null","facture_num":"string|null","facture_id":"string|null","montant_ht":null,"montant_tva":null,"taux_tva":0,"confiance":0,"alerte":"string|null","necessite_remarque":false}]}`;
-
-    // Tenter Gemini d'abord, fallback Groq
-    let content = "";
-    if (geminiKey) {
-      try {
-        const res = await fetch(
-          `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${geminiKey}`,
-          { method: "POST", headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }], generationConfig: { response_mime_type: "application/json", temperature: 0 } }) }
-        );
-        if (res.ok) {
-          const d = await res.json();
-          content = d.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
-          console.log("[RELEVE AI] Gemini OK");
-        } else { console.log("[RELEVE AI] Gemini", res.status, "→ fallback Groq"); }
-      } catch(e) { console.log("[RELEVE AI] Gemini exception → fallback Groq"); }
+   CNSS|AMO|COTIS → categorie=cnss_amo, code=6174, tva=0%
+   TVA|DGI|IR|IS|IMPOT → categorie=tva_dgi, code=4456, tva=0%
+   SALAIRE|PAIE|VIREMENT SALAIRE → categorie=salaires, code=6171, tva=0%
+   IAM|INWI|ORANGE|TELECOM|INTERNET → categorie=telecom, code=6132, tva=20%
+   LOYER|LOCATION|BAIL → categorie=loyers, code=6131, tva=20%
+   GASOIL|CARBURANT|ESSENCE → categorie=gasoil, code=6122, tva=20%
+   EAU|ONEE|AMENAU|RADEEMA → categorie=eau_electricite, code=6125, tva=7%
+   ELECTRICITE|ELEC → categorie=eau_electricite, code=6125, tva=14%
+   ASSURANCE → categorie=assurance, code=6161, tva=0%
+   COMMISSION|FRAIS BANCAIRES|FRAIS TENUE → categorie=frais_bancaires, code=6347, tva=10%
+   RETRAIT|GAB|ESPECES → categorie=retrait_especes, code=5161, tva=0%
+   IMPORT|DOUANE|DEDOUANEMENT → categorie=frais_douane, code=6146, tva=0%
+   RESTAURANT|LOUNG|CAFE|REPRESENTATION → categorie=frais_representation, code=6147, tva=0%
+   ENTRETIEN|REPARATION|MAINTENANCE → categorie=entretien, code=6141, tva=20%
+   TRANSPORT|DEPLACEMENT|BILLET → categorie=transport, code=6145, tva=0%
+   INTERETS CREDITEURS → categorie=interets_crediteurs, code=7611, tva=0%
+   → confiance 75%
+6. DIRECTION ARGENT → confiance 60%
+   credit (argent reçu) → categorie=encaissement_client, code=3421
+   debit (argent sorti) → categorie=paiement_fournisseur, code=4411
+7. INCONNU → necessite_remarque=true, alerte avec explication pour le comptable
+ 
+RÈGLE TVA: Si TVA > 0%, calculer montant_ht = montant_ttc / (1 + taux_tva/100), montant_tva = montant_ttc - montant_ht.
+RÈGLE DÉBIT/CRÉDIT: transaction.credit > 0 = argent reçu. transaction.debit > 0 = argent sorti.
+ 
+Réponds UNIQUEMENT avec ce JSON valide (pas de texte avant ou après):
+{
+  "analyses": [
+    {
+      "i": 0,
+      "categorie": "encaissement_client",
+      "code_pcm": "3421",
+      "tiers_nom": "NOM DU TIERS ou null",
+      "facture_num": "NUMERO FACTURE ou null",
+      "facture_id": "UUID EXACT de la facture ou null",
+      "montant_ht": 0.00,
+      "montant_tva": 0.00,
+      "taux_tva": 0,
+      "confiance": 85,
+      "etape_rapprochement": "nom_tiers",
+      "alerte": null,
+      "necessite_remarque": false
     }
-
-    if (!content && groqKey) {
-      const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-        method: "POST",
-        headers: { Authorization: `Bearer ${groqKey}`, "Content-Type": "application/json" },
-        body: JSON.stringify({ model: "llama-3.3-70b-versatile", temperature: 0, max_tokens: 4000, messages: [{ role: "user", content: prompt }], response_format: { type: "json_object" } }),
-      });
-      if (res.ok) {
-        const d = await res.json() as any;
-        content = d.choices[0].message.content;
-        console.log("[RELEVE AI] Groq OK");
-      }
+  ]
+}
+ 
+Les valeurs possibles pour "categorie" sont exactement:
+encaissement_client, paiement_fournisseur, salaires, cnss_amo, tva_dgi, loyers, eau_electricite, telecom, gasoil, assurance, entretien, frais_bancaires, frais_representation, frais_douane, retrait_especes, interets_crediteurs, transport, autre
+ 
+Les valeurs possibles pour "etape_rapprochement" sont exactement:
+remarques, numero_facture, nom_tiers, montant_date, mots_cles, direction, inconnu`;
+ 
+    const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${groqKey}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "llama-3.3-70b-versatile",
+        temperature: 0,
+        max_tokens: 4000,
+        messages: [{ role: "user", content: prompt }],
+        response_format: { type: "json_object" },
+      }),
+    });
+ 
+    if (!res.ok) {
+      const err = await res.json() as any;
+      throw new Error(`Groq: ${err.error?.message ?? res.status}`);
     }
-
-    if (!content) throw new Error("Aucune API IA disponible");
+ 
+    const groqData = await res.json() as any;
+    let content = groqData.choices[0].message.content;
     content = content.replace(/```json\n?/g, "").replace(/```\n?/g, "").trim();
-    return JSON.parse(content) as { analyses: any[] };
+    const parsed = JSON.parse(content) as { analyses: any[] };
+ 
+    // Vérification : s'assurer que toutes les transactions ont une analyse
+    if (parsed.analyses.length < data.transactions_brutes.length) {
+      console.log(`[RELEVE AI] Groq a retourné ${parsed.analyses.length} analyses pour ${data.transactions_brutes.length} transactions`);
+    }
+ 
+    console.log(`[RELEVE AI] Groq OK — ${parsed.analyses.length} analyses, ${parsed.analyses.filter((a: any) => a.facture_id).length} matchées`);
+    return parsed;
   });
+
 
 // ─── Helpers parser (portés de awb_line_to_tx + bp_split_line Python) ─────────
 const OCR_FIXES: Record<string, string> = {

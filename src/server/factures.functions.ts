@@ -32,57 +32,43 @@ async function envoyerEmail(to: string, subject: string, html: string): Promise<
   } catch { return false; }
 }
 
-// ─── Appel IA : Gemini si disponible, sinon Groq ────────────────────────────
+// ─── Appel Groq uniquement (Gemini bloqué depuis Codespaces) ────────────────
 async function callAI(prompt: string, imageBase64?: string, mimeType?: string): Promise<string> {
-  const geminiKey = process.env.GEMINI_API_KEY;
-  const groqKey   = process.env.GROQ_API_KEY;
+  const groqKey = process.env.GROQ_API_KEY;
+  if (!groqKey) throw new Error("GROQ_API_KEY manquante");
 
-  // Tenter Gemini d'abord (meilleur pour les factures)
-  if (geminiKey) {
-    try {
-      const parts: any[] = [{ text: prompt }];
-      if (imageBase64) parts.push({ inline_data: { mime_type: mimeType ?? "image/jpeg", data: imageBase64 } });
+  const model = imageBase64
+    ? "meta-llama/llama-4-scout-17b-16e-instruct"
+    : "llama-3.3-70b-versatile";
 
-      const res = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${geminiKey}`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ contents: [{ parts }], generationConfig: { response_mime_type: "application/json", temperature: 0.1 } }),
-        }
-      );
-      if (res.ok) {
-        const data = await res.json();
-        const content = data.candidates?.[0]?.content?.parts?.[0]?.text ?? "{}";
-        console.log("[AI] Gemini OK");
-        return content.replace(/```json\n?/g, "").replace(/```\n?/g, "").trim();
-      }
-      console.log("[AI] Gemini status:", res.status, "→ fallback Groq");
-    } catch (e) { console.log("[AI] Gemini exception:", String(e), "→ fallback Groq"); }
-  }
+  const userContent: any = imageBase64
+    ? [
+        { type: "text", text: prompt },
+        { type: "image_url", image_url: { url: `data:${mimeType ?? "image/jpeg"};base64,${imageBase64}` } },
+      ]
+    : prompt;
 
-  // Fallback Groq
-  if (groqKey) {
-    const userContent: any = imageBase64
-      ? [{ type: "text", text: prompt }, { type: "image_url", image_url: { url: `data:${mimeType};base64,${imageBase64}` } }]
-      : prompt;
-    const model = imageBase64 ? "meta-llama/llama-4-scout-17b-16e-instruct" : "llama-3.3-70b-versatile";
-    const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${groqKey}` },
-      body: JSON.stringify({ model, max_tokens: 1500, temperature: 0, messages: [{ role: "user", content: userContent }], response_format: { type: "json_object" } }),
-    });
-    if (res.ok) {
-      const data = await res.json();
-      const content = data.choices?.[0]?.message?.content ?? "{}";
-      console.log("[AI] Groq OK");
-      return content.replace(/```json\n?/g, "").replace(/```\n?/g, "").trim();
-    }
+  const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "Authorization": `Bearer ${groqKey}` },
+    body: JSON.stringify({
+      model,
+      max_tokens: 1500,
+      temperature: 0,
+      messages: [{ role: "user", content: userContent }],
+      ...(imageBase64 ? {} : { response_format: { type: "json_object" } }),
+    }),
+  });
+
+  if (!res.ok) {
     const err = await res.text();
-    console.log("[AI] Groq error:", res.status, err.slice(0,100));
+    throw new Error(`Groq ${res.status}: ${err.slice(0, 150)}`);
   }
 
-  throw new Error("Aucune API IA disponible (Gemini et Groq ont échoué)");
+  const data = await res.json() as any;
+  const content = data.choices?.[0]?.message?.content ?? "{}";
+  console.log("[OCR Groq] model:", model, "| chars:", content.length);
+  return content.replace(/```json\n?/g, "").replace(/```\n?/g, "").trim();
 }
 
 export const generateFactureXml = createServerFn({ method: "POST" })
@@ -236,7 +222,7 @@ export const ocrFacture = createServerFn({ method: "POST" })
     let confidence: "high" | "medium" | "low" = "low";
     let method = "regex";
 
-    const prompt = `Tu es expert-comptable et analyste de documents financiers marocains. Extrais les données de cette facture avec précision maximale.
+    const prompt = `Tu es expert-comptable et analyste de documents financiers marocains. Extrais les données de cette facture avec précision maximale. Réponds UNIQUEMENT avec un JSON valide, sans texte avant ou après.
 
 CONTEXTE DOSSIER:
 La société dont on gère la comptabilité est : "${dossierNom}" (ICE: "${dossierIce || "non renseigné"}")
@@ -453,4 +439,6 @@ Réponds UNIQUEMENT avec ce JSON:
     content = content.replace(/```json\n?/g, "").replace(/```\n?/g, "").trim();
     return JSON.parse(content) as { analyses: any[] };
   });
+
+
 
