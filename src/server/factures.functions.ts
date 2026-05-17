@@ -7,9 +7,7 @@ import { validerXmlUBL } from "./dgi_validator";
 
 function getSupabase() {
   const url = process.env.SUPABASE_URL ?? process.env.VITE_SUPABASE_URL ?? "";
-  const key = process.env.SUPABASE_SERVICE_ROLE_KEY
-    ?? process.env.SUPABASE_PUBLISHABLE_KEY
-    ?? process.env.VITE_SUPABASE_PUBLISHABLE_KEY ?? "";
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY ?? process.env.SUPABASE_PUBLISHABLE_KEY ?? process.env.VITE_SUPABASE_PUBLISHABLE_KEY ?? "";
   return createClient(url, key);
 }
 
@@ -20,46 +18,92 @@ const ligneSchema = z.object({
   taux_tva: z.number().min(0).max(100).default(20),
 });
 
-// ─── Envoi email via Resend ───────────────────────────────────────────────────
 async function envoyerEmail(to: string, subject: string, html: string): Promise<boolean> {
   const resendKey = process.env.RESEND_API_KEY;
   const fromEmail = process.env.FROM_EMAIL ?? "onboarding@resend.dev";
-  if (!resendKey) { console.log("[EMAIL] RESEND_API_KEY manquante"); return false; }
+  if (!resendKey) return false;
   try {
     const res = await fetch("https://api.resend.com/emails", {
       method: "POST",
       headers: { Authorization: `Bearer ${resendKey}`, "Content-Type": "application/json" },
       body: JSON.stringify({ from: `HisabPro <${fromEmail}>`, to: [to], subject, html }),
     });
-    const result = await res.json();
-    console.log("[EMAIL] Resend response:", res.status, JSON.stringify(result));
     return res.ok;
-  } catch (e) { console.log("[EMAIL] Erreur:", String(e)); return false; }
+  } catch { return false; }
 }
 
-// ─── generateFactureXml ───────────────────────────────────────────────────────
+// ─── Appel IA : Gemini si disponible, sinon Groq ────────────────────────────
+async function callAI(prompt: string, imageBase64?: string, mimeType?: string): Promise<string> {
+  const geminiKey = process.env.GEMINI_API_KEY;
+  const groqKey   = process.env.GROQ_API_KEY;
+
+  // Tenter Gemini d'abord (meilleur pour les factures)
+  if (geminiKey) {
+    try {
+      const parts: any[] = [{ text: prompt }];
+      if (imageBase64) parts.push({ inline_data: { mime_type: mimeType ?? "image/jpeg", data: imageBase64 } });
+
+      const res = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${geminiKey}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ contents: [{ parts }], generationConfig: { response_mime_type: "application/json", temperature: 0.1 } }),
+        }
+      );
+      if (res.ok) {
+        const data = await res.json();
+        const content = data.candidates?.[0]?.content?.parts?.[0]?.text ?? "{}";
+        console.log("[AI] Gemini OK");
+        return content.replace(/```json\n?/g, "").replace(/```\n?/g, "").trim();
+      }
+      console.log("[AI] Gemini status:", res.status, "→ fallback Groq");
+    } catch (e) { console.log("[AI] Gemini exception:", String(e), "→ fallback Groq"); }
+  }
+
+  // Fallback Groq
+  if (groqKey) {
+    const userContent: any = imageBase64
+      ? [{ type: "text", text: prompt }, { type: "image_url", image_url: { url: `data:${mimeType};base64,${imageBase64}` } }]
+      : prompt;
+    const model = imageBase64 ? "meta-llama/llama-4-scout-17b-16e-instruct" : "llama-3.3-70b-versatile";
+    const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${groqKey}` },
+      body: JSON.stringify({ model, max_tokens: 1500, temperature: 0, messages: [{ role: "user", content: userContent }], response_format: { type: "json_object" } }),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      const content = data.choices?.[0]?.message?.content ?? "{}";
+      console.log("[AI] Groq OK");
+      return content.replace(/```json\n?/g, "").replace(/```\n?/g, "").trim();
+    }
+    const err = await res.text();
+    console.log("[AI] Groq error:", res.status, err.slice(0,100));
+  }
+
+  throw new Error("Aucune API IA disponible (Gemini et Groq ont échoué)");
+}
+
 export const generateFactureXml = createServerFn({ method: "POST" })
   .inputValidator((input: unknown) => z.object({ facture_id: z.string().uuid() }).parse(input))
   .handler(async ({ data }) => {
     const supabase = getSupabase();
-
     const { data: facture, error: fErr } = await supabase
       .from("factures")
       .select("*, clients(nom,ice,if_fiscal,adresse,email), dossiers(nom_societe,ice,if_fiscal,adresse)")
-      .eq("id", data.facture_id)
-      .single();
+      .eq("id", data.facture_id).single();
     if (fErr || !facture) throw new Error("Facture introuvable");
 
     const lignes = ((facture.lignes ?? []) as unknown[]).map((l) => ligneSchema.parse(l));
     const societe = (facture as any).dossiers;
     const client  = (facture as any).clients;
-
     const esc = (s: string | null | undefined) =>
       (s ?? "").replace(/[<>&'"]/g, (c: string) =>
         (({ "<": "&lt;", ">": "&gt;", "&": "&amp;", "'": "&apos;", '"': "&quot;" }) as Record<string, string>)[c]);
 
     const lignesXml = lignes.map((l, i) => {
-      const ht  = l.quantite * l.prix_unitaire;
+      const ht = l.quantite * l.prix_unitaire;
       const tva = ht * (l.taux_tva / 100);
       return `  <cac:InvoiceLine>
     <cbc:ID>${i + 1}</cbc:ID>
@@ -115,140 +159,57 @@ ${lignesXml}
 </Invoice>`;
 
     const hash = createHash("sha256").update(xml).digest("hex");
-
-    await supabase.from("factures").update({
-      xml_ubl: xml, hash_sha256: hash, statut: "envoyee", statut_dgi: "en_analyse",
-    }).eq("id", data.facture_id);
+    await supabase.from("factures").update({ xml_ubl: xml, hash_sha256: hash, statut: "envoyee", statut_dgi: "en_analyse" }).eq("id", data.facture_id);
 
     const validation = await validerXmlUBL(xml);
     const { conforme, erreurs, avertissements, source } = validation;
+    const dgi_uuid = conforme ? `DGI-${Date.now().toString(36).toUpperCase()}-${Math.random().toString(36).slice(2,8).toUpperCase()}` : null;
+    const dgi_response = { source, conforme, timestamp: new Date().toISOString(), uuid: dgi_uuid, message: conforme ? "Facture validée" : "Facture rejetée", erreurs, avertissements };
 
-    const dgi_uuid = conforme
-      ? `DGI-${Date.now().toString(36).toUpperCase()}-${Math.random().toString(36).slice(2, 8).toUpperCase()}`
-      : null;
-
-    const dgi_response = {
-      source, conforme, timestamp: new Date().toISOString(), uuid: dgi_uuid,
-      message: conforme
-        ? source === "peppol"
-          ? "Facture validée par le validateur PEPPOL UBL 2.1 (conforme DGI-MA)"
-          : "Facture validée localement — structure UBL 2.1 conforme"
-        : "Facture rejetée — erreurs de conformité UBL détectées",
-      erreurs, avertissements,
-    };
-
-    await supabase.from("factures").update({
-      dgi_uuid, dgi_response,
-      statut: conforme ? "conforme" : "rejetee",
-      statut_dgi: conforme ? "conforme" : "rejetee",
-    }).eq("id", data.facture_id);
+    await supabase.from("factures").update({ dgi_uuid, dgi_response, statut: conforme ? "conforme" : "rejetee", statut_dgi: conforme ? "conforme" : "rejetee" }).eq("id", data.facture_id);
 
     if (conforme && Number(facture.montant_ttc) > 0) {
-      const ref         = facture.numero ?? facture.id;
+      const ref = facture.numero ?? facture.id;
       const typeFacture = (facture as any).type_facture ?? "standard";
-
       if (typeFacture === "acompte") {
         await supabase.from("ecritures_comptables").insert([
-          { dossier_id: facture.dossier_id, journal_code: "VTE", compte_numero: "3421",  date_ecriture: facture.date_facture, libelle: `Acompte ${ref}`,          debit: Number(facture.montant_ttc), credit: 0,                     reference_piece: ref, facture_id: facture.id, valide: true },
-          { dossier_id: facture.dossier_id, journal_code: "VTE", compte_numero: "4191",  date_ecriture: facture.date_facture, libelle: `Avance reçue ${ref}`,      debit: 0, credit: Number(facture.montant_ht),                      reference_piece: ref, facture_id: facture.id, valide: true },
-          { dossier_id: facture.dossier_id, journal_code: "VTE", compte_numero: "44551", date_ecriture: facture.date_facture, libelle: `TVA acompte ${ref}`,       debit: 0, credit: Number(facture.montant_tva),                     reference_piece: ref, facture_id: facture.id, valide: true },
+          { dossier_id: facture.dossier_id, journal_code: "VTE", compte_numero: "3421",  date_ecriture: facture.date_facture, libelle: `Acompte ${ref}`,     debit: Number(facture.montant_ttc), credit: 0, reference_piece: ref, facture_id: facture.id, valide: true },
+          { dossier_id: facture.dossier_id, journal_code: "VTE", compte_numero: "4191",  date_ecriture: facture.date_facture, libelle: `Avance reçue ${ref}`, debit: 0, credit: Number(facture.montant_ht), reference_piece: ref, facture_id: facture.id, valide: true },
+          { dossier_id: facture.dossier_id, journal_code: "VTE", compte_numero: "44551", date_ecriture: facture.date_facture, libelle: `TVA acompte ${ref}`,  debit: 0, credit: Number(facture.montant_tva), reference_piece: ref, facture_id: facture.id, valide: true },
         ]);
       } else if (typeFacture === "solde") {
         await supabase.from("ecritures_comptables").insert([
-          { dossier_id: facture.dossier_id, journal_code: "VTE", compte_numero: "3421",  date_ecriture: facture.date_facture, libelle: `Solde ${ref}`,             debit: Number(facture.montant_ttc), credit: 0,                     reference_piece: ref, facture_id: facture.id, valide: true },
-          { dossier_id: facture.dossier_id, journal_code: "VTE", compte_numero: "7111",  date_ecriture: facture.date_facture, libelle: `Vente solde ${ref}`,        debit: 0, credit: Number(facture.montant_ht),                      reference_piece: ref, facture_id: facture.id, valide: true },
-          { dossier_id: facture.dossier_id, journal_code: "VTE", compte_numero: "44551", date_ecriture: facture.date_facture, libelle: `TVA solde ${ref}`,          debit: 0, credit: Number(facture.montant_tva),                     reference_piece: ref, facture_id: facture.id, valide: true },
-          { dossier_id: facture.dossier_id, journal_code: "OD",  compte_numero: "4191",  date_ecriture: facture.date_facture, libelle: `Imputation acompte ${ref}`, debit: Number(facture.montant_ht), credit: 0,                      reference_piece: ref, facture_id: facture.id, valide: true },
-          { dossier_id: facture.dossier_id, journal_code: "OD",  compte_numero: "7111",  date_ecriture: facture.date_facture, libelle: `Imputation acompte ${ref}`, debit: 0, credit: Number(facture.montant_ht),                      reference_piece: ref, facture_id: facture.id, valide: true },
+          { dossier_id: facture.dossier_id, journal_code: "VTE", compte_numero: "3421",  date_ecriture: facture.date_facture, libelle: `Solde ${ref}`, debit: Number(facture.montant_ttc), credit: 0, reference_piece: ref, facture_id: facture.id, valide: true },
+          { dossier_id: facture.dossier_id, journal_code: "VTE", compte_numero: "7111",  date_ecriture: facture.date_facture, libelle: `Vente ${ref}`, debit: 0, credit: Number(facture.montant_ht), reference_piece: ref, facture_id: facture.id, valide: true },
+          { dossier_id: facture.dossier_id, journal_code: "VTE", compte_numero: "44551", date_ecriture: facture.date_facture, libelle: `TVA ${ref}`, debit: 0, credit: Number(facture.montant_tva), reference_piece: ref, facture_id: facture.id, valide: true },
+          { dossier_id: facture.dossier_id, journal_code: "OD",  compte_numero: "4191",  date_ecriture: facture.date_facture, libelle: `Imputation acompte ${ref}`, debit: Number(facture.montant_ht), credit: 0, reference_piece: ref, facture_id: facture.id, valide: true },
+          { dossier_id: facture.dossier_id, journal_code: "OD",  compte_numero: "7111",  date_ecriture: facture.date_facture, libelle: `Imputation acompte ${ref}`, debit: 0, credit: Number(facture.montant_ht), reference_piece: ref, facture_id: facture.id, valide: true },
         ]);
       } else {
         await supabase.from("ecritures_comptables").insert([
-          { dossier_id: facture.dossier_id, journal_code: "VTE", compte_numero: "3421",  date_ecriture: facture.date_facture, libelle: `Vente ${ref}`,             debit: Number(facture.montant_ttc), credit: 0,                     reference_piece: ref, facture_id: facture.id, valide: true },
-          { dossier_id: facture.dossier_id, journal_code: "VTE", compte_numero: "7111",  date_ecriture: facture.date_facture, libelle: `Vente ${ref}`,             debit: 0, credit: Number(facture.montant_ht),                      reference_piece: ref, facture_id: facture.id, valide: true },
-          { dossier_id: facture.dossier_id, journal_code: "VTE", compte_numero: "44551", date_ecriture: facture.date_facture, libelle: `TVA collectée ${ref}`,     debit: 0, credit: Number(facture.montant_tva),                     reference_piece: ref, facture_id: facture.id, valide: true },
+          { dossier_id: facture.dossier_id, journal_code: "VTE", compte_numero: "3421",  date_ecriture: facture.date_facture, libelle: `Vente ${ref}`, debit: Number(facture.montant_ttc), credit: 0, reference_piece: ref, facture_id: facture.id, valide: true },
+          { dossier_id: facture.dossier_id, journal_code: "VTE", compte_numero: "7111",  date_ecriture: facture.date_facture, libelle: `Vente ${ref}`, debit: 0, credit: Number(facture.montant_ht), reference_piece: ref, facture_id: facture.id, valide: true },
+          { dossier_id: facture.dossier_id, journal_code: "VTE", compte_numero: "44551", date_ecriture: facture.date_facture, libelle: `TVA collectée ${ref}`, debit: 0, credit: Number(facture.montant_tva), reference_piece: ref, facture_id: facture.id, valide: true },
         ]);
       }
-
-      await supabase.from("ged_documents").insert({
-        dossier_id: facture.dossier_id, facture_id: facture.id,
-        nom_fichier: `${facture.numero ?? facture.id}.xml`, type_document: "facture_client",
-        hash_sha256: hash, dgi_uuid, horodatage: new Date().toISOString(),
-        taille_bytes: xml.length, mime_type: "application/xml",
-      });
-
+      await supabase.from("ged_documents").insert({ dossier_id: facture.dossier_id, facture_id: facture.id, nom_fichier: `${facture.numero ?? facture.id}.xml`, type_document: "facture_client", hash_sha256: hash, dgi_uuid, horodatage: new Date().toISOString(), taille_bytes: xml.length, mime_type: "application/xml" });
       if (client?.email) {
-        const { subject, html } = emailFactureClient({
-          clientNom: client.nom, numeroFacture: facture.numero ?? facture.id,
-          montantTTC: Number(facture.montant_ttc), dateEcheance: facture.date_echeance,
-          dgiUuid: dgi_uuid ?? "", hashSha256: hash, societeNom: societe?.nom_societe ?? "HisabPro",
-        });
+        const { subject, html } = emailFactureClient({ clientNom: client.nom, numeroFacture: facture.numero ?? facture.id, montantTTC: Number(facture.montant_ttc), dateEcheance: facture.date_echeance, dgiUuid: dgi_uuid ?? "", hashSha256: hash, societeNom: societe?.nom_societe ?? "HisabPro" });
         await envoyerEmail(client.email, subject, html);
       }
     } else if (!conforme) {
       const { data: prof } = await supabase.from("profiles").select("email").limit(1).maybeSingle();
       if (prof?.email) {
-        const { subject, html } = emailFactureRejetee({
-          comptableEmail: prof.email, numeroFacture: facture.numero ?? facture.id,
-          clientNom: client?.nom ?? "Client", erreurs, dgiResponse: dgi_response,
-        });
+        const { subject, html } = emailFactureRejetee({ comptableEmail: prof.email, numeroFacture: facture.numero ?? facture.id, clientNom: client?.nom ?? "Client", erreurs, dgiResponse: dgi_response });
         await envoyerEmail(prof.email, subject, html);
       }
     }
-
-    await supabase.from("audit_logs").insert({
-      dossier_id: facture.dossier_id,
-      action: conforme ? "efacture_conforme" : "efacture_rejetee",
-      ressource_type: "facture", ressource_id: facture.id,
-      details: { dgi_uuid, hash: hash.slice(0, 16), client_email: client?.email ?? null },
-    });
-
-    return {
-      success: true, conforme, xml, hash, dgi_uuid, dgi_response,
-      email_sent: conforme && !!client?.email,
-      client_email_manquant: conforme && !client?.email,
-    };
+    await supabase.from("audit_logs").insert({ dossier_id: facture.dossier_id, action: conforme ? "efacture_conforme" : "efacture_rejetee", ressource_type: "facture", ressource_id: facture.id, details: { dgi_uuid, hash: hash.slice(0,16) } });
+    return { success: true, conforme, xml, hash, dgi_uuid, dgi_response, email_sent: conforme && !!client?.email, client_email_manquant: conforme && !client?.email };
   });
 
-// ─── marquerPayee ─────────────────────────────────────────────────────────────
-export const marquerPayee = createServerFn({ method: "POST" })
-  .inputValidator((input: unknown) => z.object({
-    facture_id: z.string().uuid(),
-    date_paiement: z.string(),
-    mode: z.string().default("virement"),
-  }).parse(input))
-  .handler(async ({ data }) => {
-    const supabase = getSupabase();
-    const { data: f } = await supabase.from("factures").select("dossier_id,montant_ttc,numero,statut").eq("id", data.facture_id).single();
-    if (!f) throw new Error("Facture introuvable");
-    if (f.statut !== "conforme") throw new Error("Seules les factures conformes DGI peuvent être marquées payées");
-    await supabase.from("factures").update({ statut_paiement: "payee", date_paiement: data.date_paiement }).eq("id", data.facture_id);
-    const ref = f.numero ?? data.facture_id;
-    await supabase.from("ecritures_comptables").insert([
-      { dossier_id: f.dossier_id, journal_code: "BQ", compte_numero: "5141", date_ecriture: data.date_paiement, libelle: `Encaissement ${ref}`, debit: Number(f.montant_ttc), credit: 0, reference_piece: ref, facture_id: data.facture_id, valide: true },
-      { dossier_id: f.dossier_id, journal_code: "BQ", compte_numero: "3421", date_ecriture: data.date_paiement, libelle: `Règlement client ${ref}`, debit: 0, credit: Number(f.montant_ttc), reference_piece: ref, facture_id: data.facture_id, valide: true },
-    ]);
-    await supabase.from("audit_logs").insert({
-      dossier_id: f.dossier_id, action: "facture_payee",
-      ressource_type: "facture", ressource_id: data.facture_id,
-      details: { date_paiement: data.date_paiement, mode: data.mode },
-    });
-    return { ok: true };
-  });
-
-// ─── ajouterEmailClient ───────────────────────────────────────────────────────
-export const ajouterEmailClient = createServerFn({ method: "POST" })
-  .inputValidator((input: unknown) => z.object({
-    client_id: z.string().uuid(),
-    email: z.string().email(),
-  }).parse(input))
-  .handler(async ({ data }) => {
-    const supabase = getSupabase();
-    const { error } = await supabase.from("clients").update({ email: data.email }).eq("id", data.client_id);
-    if (error) throw new Error(error.message);
-    return { ok: true };
-  });
-
-// ─── ocrFacture ──────────────────────────────────────────────────────────────
+// ─── ocrFacture ───────────────────────────────────────────────────────────────
+// Gemini (si disponible) → fallback Groq. Zéro regex sur les montants.
 export const ocrFacture = createServerFn({ method: "POST" })
   .inputValidator((input: unknown) => z.object({
     extracted_text: z.string().default(""),
@@ -258,120 +219,67 @@ export const ocrFacture = createServerFn({ method: "POST" })
   }).parse(input))
   .handler(async ({ data }) => {
     const supabase = getSupabase();
+    const { data: dossier } = await supabase.from("dossiers" as any).select("nom_societe,ice").eq("id", data.dossier_id).maybeSingle();
+    const dossierNom = (dossier as any)?.nom_societe ?? "";
+    const dossierIce = (dossier as any)?.ice ?? "";
     const text = data.extracted_text ?? "";
-    const norm = text.replace(/\r\n/g, "\n").replace(/\s+/g, " ");
-
-    const { data: dossier } = await supabase.from("dossiers").select("nom_societe,ice").eq("id", data.dossier_id).single();
-    const dossierNom = (dossier?.nom_societe ?? "").trim();
-    const dossierIce = (dossier?.ice ?? "").trim();
 
     let result: any = {
-      client_nom_extrait: "", ice_client: null, if_fiscal_client: null, rc_client: null,
-      numero_facture: null, date_facture: null, date_echeance: null,
-      delai_paiement_jours: null, mode_reglement: null,
+      client_nom_extrait: "", ice_client: null, numero_facture: null,
+      date_facture: null, date_echeance: null, delai_paiement_jours: 30,
       montant_ht: 0, montant_tva: 0, montant_ttc: 0, lignes: [],
-      type_facture: "standard",
-      numero_commande: null, numero_acompte: null,
+      type_facture: "standard", numero_commande: null, numero_acompte: null,
       montant_commande_total_ht: null, montant_commande_total_ttc: null,
-      montant_restant_du: null,
+      montant_restant_du: null, sens_facture: "inconnu",
+      emetteur_nom: null, emetteur_ice: null,
     };
     let confidence: "high" | "medium" | "low" = "low";
-    let method: "regex" | "ai" = "regex";
+    let method = "regex";
 
-    const groqKey = process.env.GROQ_API_KEY;
+    const prompt = `Tu es expert-comptable et analyste de documents financiers marocains. Extrais les données de cette facture avec précision maximale.
 
-    if (groqKey) {
-      try {
-        const prompt = `Tu es un expert-comptable et analyste de documents financiers marocains. Tu dois extraire les données d'une facture avec une précision maximale.
+CONTEXTE DOSSIER:
+La société dont on gère la comptabilité est : "${dossierNom}" (ICE: "${dossierIce || "non renseigné"}")
 
-═══════════════════════════════════════════════════════
-CONTEXTE CRITIQUE — DOSSIER EN COURS DE TRAITEMENT
-═══════════════════════════════════════════════════════
-La société dont on gère la comptabilité (le dossier client du cabinet) est :
-  • Nom    : "${dossierNom}"
-  • ICE    : "${dossierIce || "non renseigné"}"
+RÈGLE 1 — IDENTIFIER LES PARTIES:
+- ÉMETTEUR (vendeur) = société avec RC/CNSS/IF/ICE dans ses coordonnées ou en-tête. C'est lui qui réclame le paiement.
+- CLIENT (acheteur) = nom précédé de "Client:", "Facturer à:", "Bill to:", "Destinataire:", "Adressé à:", bloc encadré CLIENT. C'est lui qui paie.
+- Ne JAMAIS mettre l'émetteur dans client_nom.
 
-Tu DOIS comparer l'émetteur et le destinataire de la facture scannée avec cette société pour déterminer le sens (voir champ sens_facture ci-dessous).
+RÈGLE 2 — SENS DE LA FACTURE:
+Compare les noms/ICE avec la société "${dossierNom}" (ICE: "${dossierIce}"):
+- Si "${dossierNom}" est l'ÉMETTEUR → sens_facture = "client" (facture de vente émise par notre société)
+- Si "${dossierNom}" est le CLIENT → sens_facture = "fournisseur" (facture d'achat reçue d'un fournisseur)
+- Sinon → sens_facture = "inconnu"
 
-═══════════════════════════════════════════════════════
-RÈGLE 1 — IDENTIFIER LES PARTIES
-═══════════════════════════════════════════════════════
-Une facture a TOUJOURS deux parties :
+RÈGLE 3 — TYPE DE FACTURE:
+- "acompte" : contient les mots acompte, avance, versement, arrhes, reliquat, solde restant dû
+- "solde"   : facture finale après acomptes
+- "avoir"   : avoir, note de crédit, remboursement
+- "standard": facture normale
 
-1. L'ÉMETTEUR (vendeur) = celui qui ÉMET la facture et demande le paiement
-   → Identifié par : son en-tête, ses coordonnées fiscales (RC, IF, ICE, CNSS, TP), son logo
-   → emetteur_nom = son nom de société, emetteur_ice = son ICE
+RÈGLE 4 — MONTANTS (ACOMPTE):
+- montant_ttc = montant de CETTE facture seulement (pas le total commande)
+- montant_restant_du = reliquat à payer après cet acompte
+- montant_commande_total_ttc = total de toute la commande
 
-2. LE CLIENT / DESTINATAIRE (acheteur) = celui qui REÇOIT la facture et doit PAYER
-   → Identifié par les mots-clés : "Client :", "Facturer à :", "Bill to :", "Destinataire :",
-     "Adressé à :", "À l'attention de :", bloc "CLIENT", "Vendu à :"
-   → client_nom = UNIQUEMENT le nom du client, JAMAIS le nom de l'émetteur
+RÈGLE 5 — DATES: Convertir DD/MM/YYYY ou DD/MM/YY en YYYY-MM-DD.
 
-RÈGLE CRITIQUE : Ne JAMAIS confondre l'émetteur avec le client.
+RÈGLE 6 — ICE: exactement 15 chiffres consécutifs.
 
-═══════════════════════════════════════════════════════
-RÈGLE 2 — DÉTERMINER LE SENS DE LA FACTURE (OBLIGATOIRE)
-═══════════════════════════════════════════════════════
-Compare les noms et ICE de la facture avec la société du dossier ("${dossierNom}", ICE: "${dossierIce}").
-
-→ Si la société du dossier est l'ÉMETTEUR (vendeur) → sens_facture = "client"
-  (c'est une facture de VENTE que notre société a émise à un de ses clients)
-
-→ Si la société du dossier est le CLIENT / DESTINATAIRE (acheteur) → sens_facture = "fournisseur"
-  (c'est une facture d'ACHAT reçue d'un fournisseur externe)
-
-→ Si impossible à déterminer avec certitude → sens_facture = "inconnu"
-
-Règle de comparaison : tolérer les abréviations (ex: "SARL" vs "S.A.R.L"), majuscules/minuscules,
-accents, formes courtes du nom. Comparer aussi l'ICE si disponible (15 chiffres exacts).
-
-Exemple :
-  - Dossier = "ATLAS TRADING SARL", facture émise par "ATLAS TRADING" → sens = "client"
-  - Dossier = "ATLAS TRADING SARL", facture adressée à "ATLAS TRADING" → sens = "fournisseur"
-
-═══════════════════════════════════════════════════════
-RÈGLE 3 — EXTRACTION ICE
-═══════════════════════════════════════════════════════
-- Format ICE marocain : exactement 15 chiffres consécutifs
-- L'ICE dans le bloc émetteur = emetteur_ice
-- L'ICE dans le bloc client/destinataire = client_ice
-
-═══════════════════════════════════════════════════════
-RÈGLE 4 — TYPE DE FACTURE
-═══════════════════════════════════════════════════════
-- "acompte" → mots : acompte, avance, versement, arrhes, provision, reliquat, solde restant dû
-- "solde"   → facture finale après acomptes, solde de tout compte
-- "avoir"   → avoir, note de crédit, remboursement, annulation
-- "standard"→ facture normale
-
-═══════════════════════════════════════════════════════
-RÈGLE 5 — MONTANTS FACTURE D'ACOMPTE
-═══════════════════════════════════════════════════════
-- Montant COMMANDE TOTALE → montant_commande_total_ttc (ne pas mettre dans montant_ttc)
-- Montant de CET ACOMPTE  → montant_ttc
-- RELIQUAT restant        → montant_restant_du
-→ montant_ttc = UNIQUEMENT le montant de cette facture
-
-═══════════════════════════════════════════════════════
-RÈGLE 6 — LIGNES
-═══════════════════════════════════════════════════════
-- Retourner : description, quantite, prix_unitaire_ht, total_ht, taux_tva
-- Si prix_unitaire_ht absent : calculer total_ht / quantite
-- Taux TVA par défaut au Maroc : 20
-
-Réponds UNIQUEMENT avec ce JSON valide, sans markdown, sans backticks :
+Réponds UNIQUEMENT avec ce JSON valide sans markdown:
 {
   "sens_facture": "client|fournisseur|inconnu",
-  "emetteur_nom": "nom de la société émettrice",
-  "emetteur_ice": "ICE émetteur (15 chiffres) ou null",
-  "client_nom": "nom exact du CLIENT qui paie (jamais l'émetteur)",
-  "client_ice": "exactement 15 chiffres ou null",
-  "client_adresse": "adresse du client ou null",
-  "numero": "numéro de facture ou null",
-  "date": "YYYY-MM-DD ou null",
-  "date_echeance": "YYYY-MM-DD ou null",
+  "emetteur_nom": "string",
+  "emetteur_ice": "string|null",
+  "client_nom": "string",
+  "client_ice": "string|null",
+  "client_adresse": "string|null",
+  "numero": "string|null",
+  "date": "YYYY-MM-DD|null",
+  "date_echeance": "YYYY-MM-DD|null",
   "type_facture": "standard|acompte|solde|avoir",
-  "numero_commande": "numéro BC/commande ou null",
+  "numero_commande": "string|null",
   "numero_acompte": null,
   "montant_ht": 0,
   "montant_tva": 0,
@@ -380,170 +288,169 @@ Réponds UNIQUEMENT avec ce JSON valide, sans markdown, sans backticks :
   "montant_commande_total_ht": null,
   "montant_commande_total_ttc": null,
   "montant_restant_du": null,
-  "description": "description courte de la prestation",
-  "lignes": [
-    {
-      "description": "désignation",
-      "quantite": 1,
-      "prix_unitaire_ht": 0.00,
-      "total_ht": 0.00,
-      "taux_tva": 20
-    }
-  ]
-}`;
+  "description": "string",
+  "lignes": [{"description":"string","quantite":1,"prix_unitaire_ht":0,"total_ht":0,"taux_tva":20}]
+}${text ? `\n\nTexte extrait de la facture:\n${text.slice(0, 3000)}` : ""}`;
 
-        const userContent: any[] = [];
-        if (data.image_base64) {
-          userContent.push({
-            type: "image_url",
-            image_url: { url: `data:${data.mime_type};base64,${data.image_base64}` },
-          });
-        }
-        userContent.push({
-          type: "text",
-          text: prompt + (text ? `\n\nTexte extrait de la facture :\n${text.slice(0, 3000)}` : ""),
-        });
+    try {
+      const aiResponse = await callAI(prompt, data.image_base64, data.mime_type);
+      const ai = JSON.parse(aiResponse);
 
-        const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-          method: "POST",
-          headers: { "Content-Type": "application/json", "Authorization": `Bearer ${groqKey}` },
-          body: JSON.stringify({
-            model: "meta-llama/llama-4-scout-17b-16e-instruct",
-            max_tokens: 1500,
-            messages: [{ role: "user", content: userContent }],
-          }),
-        });
-
-        if (res.ok) {
-          const resData = await res.json();
-          const content = resData.choices?.[0]?.message?.content ?? "{}";
-          console.log("[OCR] Groq response:", content.slice(0, 500));
-          const matchJson = content.match(/\{[\s\S]*\}/);
-          if (matchJson) {
-            const ai = JSON.parse(matchJson[0]);
-            result = {
-              ...result,
-              sens_facture:               ai.sens_facture                        ?? "inconnu",
-              emetteur_nom:               ai.emetteur_nom                        ?? null,
-              emetteur_ice:               ai.emetteur_ice                        ?? null,
-              client_nom_extrait:         ai.client_nom                          ?? "",
-              ice_client:                 ai.client_ice                          ?? null,
-              numero_facture:             ai.numero                              ?? null,
-              date_facture:               ai.date                                ?? null,
-              date_echeance:              ai.date_echeance                       ?? null,
-              montant_ht:                 Number(ai.montant_ht)                  || 0,
-              montant_tva:                Number(ai.montant_tva)                 || 0,
-              montant_ttc:                Number(ai.montant_ttc)                 || 0,
-              type_facture:               ai.type_facture                        ?? "standard",
-              numero_commande:            ai.numero_commande                     ?? null,
-              numero_acompte:             ai.numero_acompte                      ?? null,
-              montant_commande_total_ht:  Number(ai.montant_commande_total_ht)   || null,
-              montant_commande_total_ttc: Number(ai.montant_commande_total_ttc)  || null,
-              montant_restant_du:         Number(ai.montant_restant_du)          || null,
-              lignes: (ai.lignes ?? []).map((l: any) => ({
-                designation:   l.description ?? l.designation                       ?? "Prestation",
-                quantite:      Number(l.quantite)                                   || 1,
-                prix_unitaire: Number(l.prix_unitaire_ht ?? l.prix_unitaire)        || 0,
-                taux_tva:      Number(l.taux_tva)                                   || 20,
-              })),
-            };
-            confidence = "high";
-            method     = "ai";
-            if (!result.delai_paiement_jours) result.delai_paiement_jours = 30;
-            if (!result.date_echeance && result.date_facture) {
-              const dateF = new Date(result.date_facture);
-              dateF.setDate(dateF.getDate() + (result.delai_paiement_jours ?? 30));
-              const ech = dateF.toISOString().slice(0, 10);
-              if (ech > result.date_facture) result.date_echeance = ech;
-            }
-          }
-        } else {
-          const err = await res.text();
-          console.log("[OCR] Groq error:", res.status, err.slice(0, 200));
-        }
-      } catch (e) { console.log("[OCR] exception:", String(e)); }
-    }
-
-    // ── Regex fallback — complète UNIQUEMENT les champs manquants ────────────
-    // FIX : exclure les numéros fiscaux (IF, RC, CNSS, ICE, TP) des montants
-    if (!result.ice_client) {
-      // ICE client : 15 chiffres après "Client" ou "CE :"
-      result.ice_client = norm.match(/(?:client|CE)\s*[:\-]?\s*.*?(\d{15})/i)?.[1] ?? null;
-    }
-    if (!result.numero_facture) {
-      result.numero_facture = norm.match(/(?:n°\s*facture|facture\s*n°|numéro)\s*[:\-]?\s*([A-Z0-9\/\-]+)/i)?.[1] ?? null;
-    }
-    // Regex montants : uniquement si Groq n'a rien trouvé
-    if ((!result.montant_ttc || result.montant_ttc === 0) && method === "regex") {
-      // Cherche uniquement les montants MAD/DH explicites ou formats X XXX,XX
-      // Exclut les numéros fiscaux (IF, RC, CNSS, TP) qui sont < 10 chiffres sans virgule
-      const montantRegex = /\b(\d{1,3}(?:[\s.]\d{3})*[,\.]\d{2})\s*(?:MAD|DH|Dhs)?\b/g;
-      const amounts = [...norm.matchAll(montantRegex)]
-        .map(m => parseFloat(m[1].replace(/[\s.]/g, "").replace(",", ".")))
-        .filter(n => !isNaN(n) && n >= 10 && n < 10_000_000)
-        .sort((a, b) => b - a);
-      if (amounts[0]) {
-        result.montant_ttc = amounts[0];
-        result.montant_ht  = amounts[1] ?? Math.round(amounts[0] / 1.2 * 100) / 100;
-        result.montant_tva = Math.round((result.montant_ttc - result.montant_ht) * 100) / 100;
+      result = {
+        ...result,
+        sens_facture:               ai.sens_facture              ?? "inconnu",
+        emetteur_nom:               ai.emetteur_nom              ?? null,
+        emetteur_ice:               ai.emetteur_ice              ?? null,
+        client_nom_extrait:         ai.client_nom                ?? "",
+        ice_client:                 ai.client_ice                ?? null,
+        numero_facture:             ai.numero                    ?? null,
+        date_facture:               ai.date                      ?? null,
+        date_echeance:              ai.date_echeance             ?? null,
+        montant_ht:                 Number(ai.montant_ht)        || 0,
+        montant_tva:                Number(ai.montant_tva)       || 0,
+        montant_ttc:                Number(ai.montant_ttc)       || 0,
+        type_facture:               ai.type_facture              ?? "standard",
+        numero_commande:            ai.numero_commande           ?? null,
+        numero_acompte:             ai.numero_acompte            ?? null,
+        montant_commande_total_ht:  Number(ai.montant_commande_total_ht)  || null,
+        montant_commande_total_ttc: Number(ai.montant_commande_total_ttc) || null,
+        montant_restant_du:         Number(ai.montant_restant_du)         || null,
+        lignes: (ai.lignes ?? []).map((l: any) => ({
+          designation:   l.description ?? l.designation ?? "Prestation",
+          quantite:      Number(l.quantite)                             || 1,
+          prix_unitaire: Number(l.prix_unitaire_ht ?? l.prix_unitaire) || 0,
+          taux_tva:      Number(l.taux_tva)                            || 20,
+        })),
+      };
+      confidence = "high";
+      method = "ai";
+      if (!result.date_echeance && result.date_facture) {
+        const d = new Date(result.date_facture);
+        d.setDate(d.getDate() + 30);
+        result.date_echeance = d.toISOString().slice(0, 10);
       }
-    }
-    if (!result.lignes?.length && result.montant_ttc > 0) {
-      result.lignes = [{
-        designation: "Prestation (à préciser)",
-        quantite: 1,
-        prix_unitaire: result.montant_ht,
-        taux_tva: 20,
-      }];
+    } catch (e) {
+      console.log("[OCR] IA échouée:", String(e));
     }
 
-    // ── Résolution client en base ─────────────────────────────────────────────
+    if (!result.lignes?.length && result.montant_ttc > 0) {
+      result.lignes = [{ designation: "Prestation (à préciser)", quantite: 1, prix_unitaire: result.montant_ht, taux_tva: 20 }];
+    }
+
+    // Résolution client en base
     let client_id: string | null = null;
     let client_action: "found" | "created" | "not_found" = "not_found";
     let client_trouve: any = null;
     const nomClient = result.client_nom_extrait?.trim();
     const iceClient = result.ice_client?.trim();
 
-    if (nomClient || iceClient) {
+    if ((nomClient || iceClient) && result.sens_facture !== "fournisseur") {
       if (iceClient) {
-        const { data: byIce } = await supabase.from("clients").select("*")
-          .eq("dossier_id", data.dossier_id).eq("ice", iceClient)
-          .is("deleted_at", null).maybeSingle();
+        const { data: byIce } = await supabase.from("clients").select("*").eq("dossier_id", data.dossier_id).eq("ice", iceClient).is("deleted_at", null).maybeSingle();
         if (byIce) { client_id = byIce.id; client_action = "found"; client_trouve = byIce; }
       }
       if (!client_id && nomClient) {
-        const { data: byNom } = await supabase.from("clients").select("*")
-          .eq("dossier_id", data.dossier_id).ilike("nom", `%${nomClient.slice(0, 25)}%`)
-          .is("deleted_at", null).maybeSingle();
-        if (byNom) {
-          const updates: any = {};
-          if (!byNom.ice && iceClient) updates.ice = iceClient;
-          if (Object.keys(updates).length > 0) await supabase.from("clients").update(updates).eq("id", byNom.id);
-          client_id = byNom.id; client_action = "found"; client_trouve = { ...byNom, ...updates };
-        }
+        const { data: byNom } = await supabase.from("clients").select("*").eq("dossier_id", data.dossier_id).ilike("nom", `%${nomClient.slice(0,20)}%`).is("deleted_at", null).maybeSingle();
+        if (byNom) { client_id = byNom.id; client_action = "found"; client_trouve = byNom; }
       }
-      if (!client_id) {
-        const { data: nouveau, error: ce } = await supabase.from("clients").insert({
-          dossier_id: data.dossier_id,
-          nom: nomClient || `Client ICE ${iceClient}`,
-          ice: iceClient ?? null,
-          if_fiscal: result.if_fiscal_client ?? null,
-          rc: result.rc_client ?? null,
-        }).select().single();
+      if (!client_id && result.sens_facture === "client" && nomClient) {
+        const { data: nouveau } = await supabase.from("clients").insert({ dossier_id: data.dossier_id, nom: nomClient, ice: iceClient ?? null }).select().single();
         if (nouveau) { client_id = nouveau.id; client_action = "created"; client_trouve = nouveau; }
-        else console.log("[OCR] Erreur création client:", ce?.message);
       }
     }
 
-    console.log("[OCR] final:", {
-      confidence, method, client_action,
-      sens_facture: result.sens_facture,
-      emetteur: result.emetteur_nom,
-      client: result.client_nom_extrait,
-      ttc: result.montant_ttc,
-      type_facture: result.type_facture,
-      restant: result.montant_restant_du,
-    });
-
+    console.log("[OCR] final:", { confidence, method, sens: result.sens_facture, client: result.client_nom_extrait, ttc: result.montant_ttc });
     return { result: { ...result, confidence, method, client_id, client_action, client_trouve } };
   });
+
+export const marquerPayee = createServerFn({ method: "POST" })
+  .inputValidator((input: unknown) => z.object({ facture_id: z.string().uuid(), date_paiement: z.string(), mode: z.string().default("virement") }).parse(input))
+  .handler(async ({ data }) => {
+    const supabase = getSupabase();
+    const { data: f } = await supabase.from("factures").select("dossier_id,montant_ttc,numero,statut").eq("id", data.facture_id).single();
+    if (!f) throw new Error("Facture introuvable");
+    await supabase.from("factures").update({ statut_paiement: "payee", date_paiement: data.date_paiement }).eq("id", data.facture_id);
+    const ref = f.numero ?? data.facture_id;
+    await supabase.from("ecritures_comptables").insert([
+      { dossier_id: f.dossier_id, journal_code: "BQ", compte_numero: "5141", date_ecriture: data.date_paiement, libelle: `Encaissement ${ref}`, debit: Number(f.montant_ttc), credit: 0, reference_piece: ref, facture_id: data.facture_id, valide: true },
+      { dossier_id: f.dossier_id, journal_code: "BQ", compte_numero: "3421", date_ecriture: data.date_paiement, libelle: `Règlement client ${ref}`, debit: 0, credit: Number(f.montant_ttc), reference_piece: ref, facture_id: data.facture_id, valide: true },
+    ]);
+    return { ok: true };
+  });
+
+export const ajouterEmailClient = createServerFn({ method: "POST" })
+  .inputValidator((input: unknown) => z.object({ client_id: z.string().uuid(), email: z.string().email() }).parse(input))
+  .handler(async ({ data }) => {
+    const supabase = getSupabase();
+    const { error } = await supabase.from("clients").update({ email: data.email }).eq("id", data.client_id);
+    if (error) throw new Error(error.message);
+    return { ok: true };
+  });
+
+// ─── analyserTransactions (pour relevé bancaire) ──────────────────────────────
+export const analyserTransactions = createServerFn({ method: "POST" })
+  .inputValidator((input: unknown) => z.object({
+    dossier_id: z.string().uuid(),
+    dossier_nom: z.string().default(""),
+    dossier_ice: z.string().default(""),
+    transactions_brutes: z.array(z.any()),
+    factures_client: z.array(z.any()),
+    factures_fourn: z.array(z.any()),
+    fournisseurs: z.array(z.any()),
+    clients: z.array(z.any()),
+    remarques: z.string().optional(),
+  }).parse(input))
+  .handler(async ({ data }) => {
+    const prompt = `Tu es expert-comptable marocain certifié (PCM/CGNC). Analyse ces transactions bancaires.
+
+SOCIÉTÉ: "${data.dossier_nom}" (ICE: ${data.dossier_ice || "non renseigné"})
+CRÉDITS = encaissements clients. DÉBITS = paiements fournisseurs ou charges.
+
+FACTURES CLIENTS NON ENCAISSÉES:
+${JSON.stringify(data.factures_client.map((f: any) => ({ id: f.id, num: f.numero, client: f.clients?.nom, ttc: Number(f.montant_ttc), echeance: f.date_echeance })))}
+
+FACTURES FOURNISSEURS NON PAYÉES:
+${JSON.stringify(data.factures_fourn.map((f: any) => ({ id: f.id, num: f.numero, fournisseur: f.fournisseur_nom, ttc: Number(f.montant_ttc), echeance: f.date_echeance })))}
+
+CLIENTS: ${JSON.stringify(data.clients.map((c: any) => ({ nom: c.nom, ice: c.ice })))}
+FOURNISSEURS: ${JSON.stringify(data.fournisseurs.map((f: any) => ({ nom: f.nom, ice: f.ice })))}
+${data.remarques ? `REMARQUES (PRIORITÉ ABSOLUE):\n${data.remarques}\n` : ""}
+
+TRANSACTIONS:
+${JSON.stringify(data.transactions_brutes.map((tx: any) => ({ ligne: tx.ligne, date: tx.date_operation, libelle: tx.nature_operation, debit: tx.montant_debit, credit: tx.montant_credit })))}
+
+ALGORITHME (ordre strict):
+1. REMARQUES → 100%
+2. NUMÉRO FACTURE dans libellé → 95%, retourner facture_id UUID
+3. NOM TIERS dans libellé (3+ lettres communes) → 85%, retourner facture_id si montant compatible
+4. MONTANT TTC EXACT ±1 MAD + date ≤ echeance+15j → 80%, retourner facture_id
+5. MOTS-CLÉS PCM:
+   CNSS|AMO→6174(0%) | TVA|DGI|IR|IS→4456(0%) | SALAIRE→6171(0%)
+   IAM|INWI|ORANGE|TELECOM→6132(20%) | LOYER|LOCATION→6131(20%)
+   GASOIL|CARBURANT→6122(20%) | EAU|ONEE|AMENAU→6125(7%)
+   ASSURANCE→6161(0%) | FRAIS BANCAIRES|COMMISSION→6347(10%)
+   RETRAIT|GAB|ESPECES→5161(0%) | IMPORT|DOUANE→6146(0%)
+   RESTAURANT|LOUNG|CAFE|REPRESENTATION→6147(0%)
+   ENTRETIEN|REPARATION→6141(20%) | TRANSPORT|DEPLACEMENT→6145(0%)
+   → 75%
+6. DIRECTION: credit→encaissement_client/3421, debit→paiement_fournisseur/4411 → 60%
+7. INCONNU → necessite_remarque=true
+
+Réponds UNIQUEMENT avec ce JSON:
+{"analyses":[{"ligne":0,"nature_principale":"encaissement_client|paiement_fournisseur|salaires|cnss_amo|tva_dgi|loyers|eau_electricite|telecom|gasoil|assurance|entretien|frais_bancaires|frais_representation|frais_douane|retrait_especes|interets_crediteurs|virement_interne|autre","code_pcm":"string","tiers_nom":"string|null","facture_num":"string|null","facture_id":"string|null","montant_ht":0,"montant_tva":0,"taux_tva":0,"confiance":0,"etape_rapprochement":"remarques|numero_facture|nom_tiers|montant_date|mots_cles|direction|inconnu","alerte":"string|null","necessite_remarque":false,"message_pour_comptable":"string|null","suggestions":[]}]}`;
+
+    const groqKey = process.env.GROQ_API_KEY;
+    if (!groqKey) throw new Error("GROQ_API_KEY manquante");
+
+    const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${groqKey}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ model: "llama-3.3-70b-versatile", temperature: 0, max_tokens: 4000, messages: [{ role: "user", content: prompt }], response_format: { type: "json_object" } }),
+    });
+    if (!res.ok) { const err = await res.json() as any; throw new Error(`Groq: ${err.error?.message ?? "erreur"}`); }
+    const groqData = await res.json() as any;
+    let content = groqData.choices[0].message.content;
+    content = content.replace(/```json\n?/g, "").replace(/```\n?/g, "").trim();
+    return JSON.parse(content) as { analyses: any[] };
+  });
+

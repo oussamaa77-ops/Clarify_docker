@@ -36,7 +36,6 @@ function AppLayout() {
     { to: "/dossiers/$dossierId/fiscalite",     label: "Fiscalité",       icon: Receipt         },
     { to: "/dossiers/$dossierId/paie",          label: "Paie & RH",       icon: Users2          },
     { to: "/dossiers/$dossierId/banque",        label: "Banque",          icon: Landmark        },
-    { to: "/dossiers/$dossierId/relevescanner", label: "Scanner relevé",  icon: FileSearch      },
     { to: "/dossiers/$dossierId/ged",           label: "GED",             icon: FolderArchive   },
     { to: "/dossiers/$dossierId/audit",         label: "Audit",           icon: History         },
   ] : [];
