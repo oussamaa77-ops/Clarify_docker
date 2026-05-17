@@ -1,324 +1,506 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { useEffect, useState } from "react";
+import { useEffect, useState, useCallback } from "react";
 import { supabase } from "@/integrations/supabase/client";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
+import { Card, CardContent } from "@/components/ui/card";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { BookOpen, Download, FileText, Calculator, TrendingUp } from "lucide-react";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog";
+import { Loader2, Download, Trash2, Plus, Save, RefreshCw, AlertTriangle, CheckCircle } from "lucide-react";
+import { toast } from "sonner";
 
-export const Route = createFileRoute("/_app/dossiers/$dossierId/comptabilite")({ component: ComptaPage });
+export const Route = createFileRoute("/_app/dossiers/$dossierId/comptabilite")({
+  component: ComptabilitePage,
+});
+
+interface Ecriture {
+  id: string;
+  date_ecriture: string;
+  journal_code: string;
+  compte_numero: string;
+  libelle: string;
+  debit: number;
+  credit: number;
+  reference_piece: string | null;
+  valide: boolean;
+  _modifie?: boolean;
+  _nouveau?: boolean;
+}
+
+interface LigneBalance {
+  compte: string;
+  total_debit: number;
+  total_credit: number;
+  solde: number;
+  sens: "D" | "C";
+}
+
+const JOURNAUX = ["BQ","VTE","ACH","CAI","OD","VTE-AVR","ACH-AVR"];
+const COMPTES_COURANTS = [
+  "3421","3424","3427","3429","4411","4415","4417","4419",
+  "4191","4197","5141","5161","6111","6112","6121","6122",
+  "6125","6131","6132","6141","6145","6146","6147","6161",
+  "6171","6174","6313","6347","7111","7121","7161",
+  "34552","44551","4456","4458",
+];
 
 const fmt = (n: number) => Number(n).toLocaleString("fr-MA", { minimumFractionDigits: 2 });
-const fmtMAD = (n: number) => fmt(n) + " MAD";
 
-// ── Classification PCM CGNC marocain ─────────────────────────────────────────
-function classifierCompte(numero: string, solde: number): { section: string; groupe: string; ordre: number } | null {
-  const premier = numero[0];
-  const deuxieme = numero.slice(0, 2);
-
-  if (premier === "1") {
-    if (deuxieme === "10") return { section: "PASSIF", groupe: "Capitaux propres", ordre: 1 };
-    if (deuxieme === "11") return { section: "PASSIF", groupe: "Capitaux propres assimilés", ordre: 2 };
-    if (deuxieme === "14") return { section: "PASSIF", groupe: "Dettes de financement", ordre: 3 };
-    return { section: "PASSIF", groupe: "Financement permanent", ordre: 4 };
-  }
-  if (premier === "2") return { section: "ACTIF", groupe: "Actif immobilisé", ordre: 1 };
-  if (premier === "3") {
-    return { section: solde >= 0 ? "ACTIF" : "PASSIF", groupe: solde >= 0 ? "Créances de l'actif circulant" : "Passif circulant", ordre: 3 };
-  }
-  if (premier === "4") {
-    return { section: solde <= 0 ? "PASSIF" : "ACTIF", groupe: solde <= 0 ? "Dettes du passif circulant" : "Actif circulant", ordre: 5 };
-  }
-  if (premier === "5") return { section: solde >= 0 ? "ACTIF" : "PASSIF", groupe: solde >= 0 ? "Trésorerie - Actif" : "Trésorerie - Passif", ordre: 6 };
-  if (premier === "6") {
-    if (deuxieme === "61") return { section: "CPC", groupe: "Achats et charges externes", ordre: 1 };
-    if (deuxieme === "63") return { section: "CPC", groupe: "Impôts et taxes", ordre: 2 };
-    if (deuxieme === "64") return { section: "CPC", groupe: "Charges de personnel", ordre: 3 };
-    if (deuxieme === "65") return { section: "CPC", groupe: "Autres charges d'exploitation", ordre: 4 };
-    if (deuxieme === "66") return { section: "CPC", groupe: "Charges financières", ordre: 5 };
-    if (deuxieme === "67") return { section: "CPC", groupe: "Charges non courantes", ordre: 6 };
-    return { section: "CPC", groupe: "Charges", ordre: 7 };
-  }
-  if (premier === "7") {
-    if (deuxieme === "71") return { section: "CPC_PRODUITS", groupe: "Produits d'exploitation", ordre: 1 };
-    if (deuxieme === "73") return { section: "CPC_PRODUITS", groupe: "Produits financiers", ordre: 2 };
-    if (deuxieme === "75") return { section: "CPC_PRODUITS", groupe: "Subventions d'exploitation", ordre: 3 };
-    return { section: "CPC_PRODUITS", groupe: "Produits", ordre: 4 };
-  }
-  return null;
-}
-
-const PCM_INTITULES: Record<string, string> = {
-  "1011": "Capital social", "3421": "Clients et comptes rattachés",
-  "4411": "Fournisseurs", "5141": "Banques", "5161": "Caisse",
-  "6111": "Achats de matières", "7111": "Ventes de marchandises",
-};
-
-function getIntitule(numero: string, comptes: any[]): string {
-  const cpte = comptes.find(c => c.numero === numero);
-  return cpte ? cpte.intitule : (PCM_INTITULES[numero] || `Compte ${numero}`);
-}
-
-function ComptaPage() {
+function ComptabilitePage() {
   const { dossierId } = Route.useParams();
-  const [ecritures, setEcritures] = useState<any[]>([]);
-  const [comptes, setComptes] = useState<any[]>([]);
-  const [filterCompte, setFilterCompte] = useState("");
-  const [tab, setTab] = useState("balance");
-  const [exercice, setExercice] = useState(new Date().getFullYear().toString());
+  const [tab, setTab] = useState<"grandlivre"|"balance"|"saisie">("grandlivre");
+  const [ecritures, setEcritures] = useState<Ecriture[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
 
-  useEffect(() => {
-    Promise.all([
-      supabase.from("ecritures_comptables").select("*").eq("dossier_id", dossierId).order("date_ecriture", { ascending: false }),
-      supabase.from("comptes_comptables").select("*").eq("dossier_id", dossierId).order("numero"),
-    ]).then(([{ data: e }, { data: c }]) => {
-      setEcritures((e ?? []) as any[]);
-      setComptes((c ?? []) as any[]);
-    });
-  }, [dossierId]);
+  // Filtres
+  const [filtreJournal, setFiltreJournal] = useState("TOUS");
+  const [filtreCompte, setFiltreCompte] = useState("");
+  const [filtreDateDeb, setFiltreDateDeb] = useState("");
+  const [filtreDateFin, setFiltreDateFin] = useState("");
 
-  // ── Balance ──
-  const balanceMap: Record<string, { intitule: string; debit: number; credit: number }> = {};
-  for (const e of ecritures) {
-    if (!e.date_ecriture?.startsWith(exercice)) continue;
-    const num = e.compte_numero ?? "?";
-    if (!balanceMap[num]) balanceMap[num] = { intitule: getIntitule(num, comptes), debit: 0, credit: 0 };
-    balanceMap[num].debit += Number(e.debit);
-    balanceMap[num].credit += Number(e.credit);
-  }
-  const balance = Object.entries(balanceMap)
-    .map(([numero, v]) => ({ numero, ...v, solde: v.debit - v.credit }))
-    .sort((a, b) => a.numero.localeCompare(b.numero));
-  
-  const totalDebit = balance.reduce((s, r) => s + r.debit, 0);
-  const totalCredit = balance.reduce((s, r) => s + r.credit, 0);
+  // Nouvelle écriture
+  const [newDate, setNewDate] = useState(new Date().toISOString().slice(0,10));
+  const [newJournal, setNewJournal] = useState("OD");
+  const [newCompte, setNewCompte] = useState("");
+  const [newLibelle, setNewLibelle] = useState("");
+  const [newDebit, setNewDebit] = useState(0);
+  const [newCredit, setNewCredit] = useState(0);
+  const [newRef, setNewRef] = useState("");
 
-  // ── Logique Bilan & CPC ──
-  const actifItems: any[] = [];
-  const passifItems: any[] = [];
-  const cpcCharges: Record<string, any> = {};
-  const cpcProduits: Record<string, any> = {};
-  let chargesTotal = 0, produitsTotal = 0;
+  // Suppression
+  const [deleteIds, setDeleteIds] = useState<Set<string>>(new Set());
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const [deleteLot, setDeleteLot] = useState<{journal?:string;date?:string}|null>(null);
 
-  balance.forEach(r => {
-    const classif = classifierCompte(r.numero, r.solde);
-    if (!classif) return;
-    const montant = Math.abs(r.solde);
+  const load = useCallback(async () => {
+    setLoading(true);
+    let query = supabase.from("ecritures_comptables")
+      .select("*").eq("dossier_id", dossierId)
+      .order("date_ecriture", { ascending: false })
+      .order("journal_code").order("created_at", { ascending: true });
 
-    if (classif.section === "ACTIF") actifItems.push({ ...r, montant, groupe: classif.groupe });
-    else if (classif.section === "PASSIF") passifItems.push({ ...r, montant, groupe: classif.groupe });
-    else if (classif.section === "CPC") {
-      if (!cpcCharges[classif.groupe]) cpcCharges[classif.groupe] = { items: [], total: 0 };
-      cpcCharges[classif.groupe].items.push({ ...r, montant });
-      cpcCharges[classif.groupe].total += montant;
-      chargesTotal += montant;
-    } else if (classif.section === "CPC_PRODUITS") {
-      if (!cpcProduits[classif.groupe]) cpcProduits[classif.groupe] = { items: [], total: 0 };
-      cpcProduits[classif.groupe].items.push({ ...r, montant });
-      cpcProduits[classif.groupe].total += montant;
-      produitsTotal += montant;
+    if (filtreJournal !== "TOUS") query = query.eq("journal_code", filtreJournal);
+    if (filtreCompte) query = query.eq("compte_numero", filtreCompte);
+    if (filtreDateDeb) query = query.gte("date_ecriture", filtreDateDeb);
+    if (filtreDateFin) query = query.lte("date_ecriture", filtreDateFin);
+
+    const { data, error } = await query.limit(1000);
+    if (error) { toast.error(error.message); setLoading(false); return; }
+    setEcritures((data ?? []) as Ecriture[]);
+    setLoading(false);
+    setDeleteIds(new Set());
+  }, [dossierId, filtreJournal, filtreCompte, filtreDateDeb, filtreDateFin]);
+
+  useEffect(() => { load(); }, [load]);
+
+  // Modifier une écriture
+  const updateEcriture = (id: string, field: keyof Ecriture, value: any) => {
+    setEcritures(prev => prev.map(e =>
+      e.id === id ? { ...e, [field]: value, _modifie: true } : e
+    ));
+  };
+
+  // Sauvegarder les modifications
+  const sauvegarder = async () => {
+    const modifiees = ecritures.filter(e => e._modifie && !e._nouveau);
+    if (!modifiees.length) { toast.info("Aucune modification"); return; }
+    setSaving(true);
+    try {
+      for (const e of modifiees) {
+        const { error } = await supabase.from("ecritures_comptables").update({
+          date_ecriture: e.date_ecriture,
+          journal_code: e.journal_code,
+          compte_numero: e.compte_numero,
+          libelle: e.libelle,
+          debit: Number(e.debit),
+          credit: Number(e.credit),
+          reference_piece: e.reference_piece,
+        }).eq("id", e.id);
+        if (error) throw error;
+      }
+      toast.success(`${modifiees.length} écriture(s) sauvegardée(s)`);
+      load();
+    } catch (e: any) { toast.error(e.message); }
+    finally { setSaving(false); }
+  };
+
+  // Ajouter écriture manuelle
+  const ajouterEcriture = async () => {
+    if (!newCompte || !newDate || (!newDebit && !newCredit)) {
+      toast.error("Compte, date et montant requis"); return;
     }
-  });
-
-  const resultatNet = produitsTotal - chargesTotal;
-  const totalActif = actifItems.reduce((s, i) => s + i.montant, 0);
-  const totalPassif = passifItems.reduce((s, i) => s + i.montant, 0) + (resultatNet > 0 ? resultatNet : 0);
-
-  const grouper = (items: any[]) => {
-    const groups: Record<string, any[]> = {};
-    items.forEach(i => { if (!groups[i.groupe]) groups[i.groupe] = []; groups[i.groupe].push(i); });
-    return groups;
+    setSaving(true);
+    try {
+      const { error } = await supabase.from("ecritures_comptables").insert({
+        dossier_id: dossierId,
+        journal_code: newJournal,
+        compte_numero: newCompte,
+        date_ecriture: newDate,
+        libelle: newLibelle,
+        debit: newDebit || 0,
+        credit: newCredit || 0,
+        reference_piece: newRef || null,
+        valide: true,
+      });
+      if (error) throw error;
+      toast.success("Écriture ajoutée");
+      setNewDebit(0); setNewCredit(0); setNewLibelle(""); setNewRef(""); setNewCompte("");
+      load();
+    } catch (e: any) { toast.error(e.message); }
+    finally { setSaving(false); }
   };
 
-  // ── Exports ──
-  const exportCSV = (data: string[][], filename: string) => {
-    const csv = data.map(row => row.join(";")).join("\n");
-    const blob = new Blob(["\uFEFF" + csv], { type: "text/csv;charset=utf-8;" });
-    const a = document.createElement("a"); a.href = URL.createObjectURL(blob);
-    a.download = filename; a.click();
+  // Suppression sélective
+  const supprimerSelection = async () => {
+    if (!deleteIds.size) { toast.warning("Aucune écriture sélectionnée"); return; }
+    setSaving(true);
+    try {
+      const ids = Array.from(deleteIds);
+      const { error } = await supabase.from("ecritures_comptables").delete().in("id", ids);
+      if (error) throw error;
+      toast.success(`${ids.length} écriture(s) supprimée(s)`);
+      setDeleteIds(new Set()); setConfirmDelete(false);
+      load();
+    } catch (e: any) { toast.error(e.message); }
+    finally { setSaving(false); }
   };
 
-  const filteredEcritures = filterCompte
-    ? ecritures.filter(e => (e.compte_numero ?? "").includes(filterCompte) || (e.libelle ?? "").toLowerCase().includes(filterCompte.toLowerCase()))
-    : ecritures;
+  // Suppression par lot (journal + date)
+  const supprimerLot = async () => {
+    if (!deleteLot) return;
+    setSaving(true);
+    try {
+      let query = supabase.from("ecritures_comptables").delete().eq("dossier_id", dossierId);
+      if (deleteLot.journal) query = query.eq("journal_code", deleteLot.journal);
+      if (deleteLot.date) query = query.eq("date_ecriture", deleteLot.date);
+      const { error } = await query;
+      if (error) throw error;
+      toast.success("Écritures supprimées");
+      setDeleteLot(null); setConfirmDelete(false);
+      load();
+    } catch (e: any) { toast.error(e.message); }
+    finally { setSaving(false); }
+  };
+
+  // Toggle sélection
+  const toggleSelect = (id: string) => {
+    setDeleteIds(prev => {
+      const next = new Set(prev);
+      next.has(id) ? next.delete(id) : next.add(id);
+      return next;
+    });
+  };
+
+  const toggleAll = () => {
+    if (deleteIds.size === ecritures.length) setDeleteIds(new Set());
+    else setDeleteIds(new Set(ecritures.map(e => e.id)));
+  };
+
+  // Calcul balance
+  const balance: LigneBalance[] = Object.values(
+    ecritures.reduce((acc: Record<string, LigneBalance>, e) => {
+      const c = e.compte_numero;
+      if (!acc[c]) acc[c] = { compte: c, total_debit: 0, total_credit: 0, solde: 0, sens: "D" };
+      acc[c].total_debit += Number(e.debit);
+      acc[c].total_credit += Number(e.credit);
+      return acc;
+    }, {})
+  ).map(l => {
+    const solde = Math.abs(l.total_debit - l.total_credit);
+    const sens: "D" | "C" = l.total_debit >= l.total_credit ? "D" : "C";
+    return { ...l, solde, sens };
+  }).sort((a, b) => a.compte.localeCompare(b.compte));
+
+  const totalDebit = ecritures.reduce((s, e) => s + Number(e.debit), 0);
+  const totalCredit = ecritures.reduce((s, e) => s + Number(e.credit), 0);
+  const equilibre = Math.abs(totalDebit - totalCredit) < 0.01;
+
+  // Export Excel
+  const exportExcel = async () => {
+    const XLSX = await import("xlsx");
+    const wb = XLSX.utils.book_new();
+
+    // Grand livre
+    const glData = [
+      ["Date", "Journal", "Compte", "Libellé", "Débit", "Crédit", "Réf."],
+      ...ecritures.map(e => [e.date_ecriture, e.journal_code, e.compte_numero, e.libelle, Number(e.debit)||"", Number(e.credit)||"", e.reference_piece||""]),
+    ];
+    const wsGL = XLSX.utils.aoa_to_sheet(glData);
+    wsGL["!cols"] = [{wch:12},{wch:8},{wch:10},{wch:50},{wch:14},{wch:14},{wch:15}];
+    XLSX.utils.book_append_sheet(wb, wsGL, "Grand Livre");
+
+    // Balance
+    const balData = [
+      ["Compte", "Total Débit", "Total Crédit", "Solde", "Sens"],
+      ...balance.map(l => [l.compte, l.total_debit, l.total_credit, l.solde, l.sens]),
+      ["TOTAL", totalDebit, totalCredit, Math.abs(totalDebit-totalCredit), equilibre?"✅":"⚠️"],
+    ];
+    const wsBal = XLSX.utils.aoa_to_sheet(balData);
+    XLSX.utils.book_append_sheet(wb, wsBal, "Balance");
+
+    XLSX.writeFile(wb, `Comptabilite_${dossierId.slice(0,8)}_${new Date().toISOString().slice(0,10)}.xlsx`);
+    toast.success("Export Excel généré");
+  };
+
+  const modifiees = ecritures.filter(e => e._modifie).length;
 
   return (
-    <div className="p-8 max-w-7xl mx-auto">
+    <div className="p-6 max-w-7xl mx-auto">
+      {/* Header */}
       <div className="flex items-center justify-between mb-6">
         <div>
-          <h1 className="text-3xl font-bold">Comptabilité</h1>
-          <p className="text-muted-foreground mt-1">Gestion du Plan Comptable Marocain (PCM)</p>
+          <h1 className="text-2xl font-bold">Comptabilité</h1>
+          <p className="text-muted-foreground text-sm mt-0.5">Grand livre · Balance · Saisie manuelle</p>
         </div>
-        <Select value={exercice} onValueChange={setExercice}>
-          <SelectTrigger className="w-32"><SelectValue /></SelectTrigger>
-          <SelectContent>{[2024, 2025, 2026].map(y => <SelectItem key={y} value={String(y)}>{y}</SelectItem>)}</SelectContent>
-        </Select>
+        <div className="flex gap-2">
+          {modifiees > 0 && (
+            <Button onClick={sauvegarder} disabled={saving} className="bg-green-600 hover:bg-green-700">
+              {saving ? <Loader2 className="h-4 w-4 mr-2 animate-spin"/> : <Save className="h-4 w-4 mr-2"/>}
+              Sauvegarder ({modifiees})
+            </Button>
+          )}
+          {deleteIds.size > 0 && (
+            <Button variant="destructive" onClick={()=>setConfirmDelete(true)}>
+              <Trash2 className="h-4 w-4 mr-2"/>Supprimer ({deleteIds.size})
+            </Button>
+          )}
+          <Button variant="outline" onClick={exportExcel}><Download className="h-4 w-4 mr-2"/>Export Excel</Button>
+          <Button variant="outline" onClick={load}><RefreshCw className="h-4 w-4 mr-2"/>Actualiser</Button>
+        </div>
       </div>
 
-      <Tabs value={tab} onValueChange={setTab}>
-        <TabsList className="grid w-full grid-cols-6 mb-8">
-          <TabsTrigger value="balance">Balance</TabsTrigger>
-          <TabsTrigger value="grandlivre">Grand Livre</TabsTrigger>
-          <TabsTrigger value="bilan">Bilan</TabsTrigger>
-          <TabsTrigger value="cpc">CPC</TabsTrigger>
-          <TabsTrigger value="esg">ESG</TabsTrigger>
-          <TabsTrigger value="comptes">Plan PCM</TabsTrigger>
+      {/* Équilibre */}
+      <div className={`flex items-center gap-2 mb-4 p-3 rounded-lg ${equilibre?"bg-green-50 text-green-700":"bg-red-50 text-red-700"}`}>
+        {equilibre ? <CheckCircle className="h-4 w-4"/> : <AlertTriangle className="h-4 w-4"/>}
+        <span className="text-sm font-medium">
+          {equilibre ? "✅ Balance équilibrée" : `⚠️ Écart: ${fmt(Math.abs(totalDebit-totalCredit))} MAD`}
+          &nbsp;— Total Débit: <strong>{fmt(totalDebit)}</strong> / Total Crédit: <strong>{fmt(totalCredit)}</strong>
+        </span>
+      </div>
+
+      {/* Filtres */}
+      <div className="flex gap-3 mb-4 flex-wrap">
+        <Select value={filtreJournal} onValueChange={setFiltreJournal}>
+          <SelectTrigger className="w-32"><SelectValue placeholder="Journal"/></SelectTrigger>
+          <SelectContent>
+            <SelectItem value="TOUS">Tous journaux</SelectItem>
+            {JOURNAUX.map(j => <SelectItem key={j} value={j}>{j}</SelectItem>)}
+          </SelectContent>
+        </Select>
+        <Input placeholder="Compte (ex: 3421)" value={filtreCompte} onChange={e=>setFiltreCompte(e.target.value)} className="w-36"/>
+        <Input type="date" value={filtreDateDeb} onChange={e=>setFiltreDateDeb(e.target.value)} className="w-36"/>
+        <Input type="date" value={filtreDateFin} onChange={e=>setFiltreDateFin(e.target.value)} className="w-36"/>
+        <Button variant="outline" size="sm" onClick={()=>{setFiltreJournal("TOUS");setFiltreCompte("");setFiltreDateDeb("");setFiltreDateFin("");}}>Réinitialiser</Button>
+        {(filtreJournal!=="TOUS"||filtreDateDeb) && (
+          <Button variant="destructive" size="sm" onClick={()=>{setDeleteLot({journal:filtreJournal!=="TOUS"?filtreJournal:undefined,date:filtreDateDeb||undefined});setConfirmDelete(true);}}>
+            <Trash2 className="h-3.5 w-3.5 mr-1"/>Supprimer filtre
+          </Button>
+        )}
+      </div>
+
+      <Tabs value={tab} onValueChange={v=>setTab(v as any)}>
+        <TabsList>
+          <TabsTrigger value="grandlivre">Grand Livre ({ecritures.length})</TabsTrigger>
+          <TabsTrigger value="balance">Balance ({balance.length} comptes)</TabsTrigger>
+          <TabsTrigger value="saisie">Saisie manuelle</TabsTrigger>
         </TabsList>
 
-        <TabsContent value="balance">
-          <Card><CardContent className="p-0">
-            <Table>
-              <TableHeader><TableRow>
-                <TableHead>Compte</TableHead><TableHead>Intitulé</TableHead>
-                <TableHead className="text-right">Débit</TableHead><TableHead className="text-right">Crédit</TableHead>
-                <TableHead className="text-right">Solde</TableHead>
-              </TableRow></TableHeader>
-              <TableBody>
-                {balance.map(r => (
-                  <TableRow key={r.numero}>
-                    <TableCell className="font-mono font-bold">{r.numero}</TableCell>
-                    <TableCell>{r.intitule}</TableCell>
-                    <TableCell className="text-right">{fmt(r.debit)}</TableCell>
-                    <TableCell className="text-right">{fmt(r.credit)}</TableCell>
-                    <TableCell className={`text-right font-bold ${r.solde >= 0 ? "text-green-600" : "text-red-600"}`}>{fmt(Math.abs(r.solde))} {r.solde >= 0 ? "D" : "C"}</TableCell>
-                  </TableRow>
+        {/* ── GRAND LIVRE ÉDITABLE ── */}
+        <TabsContent value="grandlivre" className="mt-4">
+          {loading ? (
+            <div className="flex justify-center py-12"><Loader2 className="h-6 w-6 animate-spin"/></div>
+          ) : (
+            <div className="rounded-lg border overflow-hidden">
+              {/* En-tête */}
+              <div className="grid grid-cols-12 gap-1 px-3 py-2 bg-muted text-xs font-semibold text-muted-foreground uppercase sticky top-0 z-10">
+                <div className="col-span-1 flex items-center gap-1">
+                  <input type="checkbox" checked={deleteIds.size===ecritures.length&&ecritures.length>0} onChange={toggleAll} className="h-3 w-3"/>
+                  <span>#</span>
+                </div>
+                <div className="col-span-1">Date</div>
+                <div className="col-span-1">Journal</div>
+                <div className="col-span-1">Compte</div>
+                <div className="col-span-4">Libellé</div>
+                <div className="col-span-2 text-right">Débit</div>
+                <div className="col-span-2 text-right">Crédit</div>
+              </div>
+
+              {/* Lignes éditables */}
+              <div className="max-h-[60vh] overflow-y-auto">
+                {ecritures.map((e, idx) => (
+                  <div key={e.id}
+                    className={`grid grid-cols-12 gap-1 px-3 py-1 border-b items-center text-xs
+                      ${deleteIds.has(e.id) ? "bg-red-50 dark:bg-red-950/20" : idx%2===0 ? "bg-white dark:bg-background" : "bg-muted/20"}
+                      ${e._modifie ? "border-l-2 border-l-blue-400" : ""}
+                    `}>
+                    <div className="col-span-1 flex items-center gap-1">
+                      <input type="checkbox" checked={deleteIds.has(e.id)} onChange={()=>toggleSelect(e.id)} className="h-3 w-3"/>
+                      <span className="text-muted-foreground">{idx+1}</span>
+                    </div>
+                    <div className="col-span-1">
+                      <input type="date" value={e.date_ecriture}
+                        onChange={ev=>updateEcriture(e.id,"date_ecriture",ev.target.value)}
+                        className="w-full text-xs bg-transparent border-0 focus:outline-none focus:ring-1 focus:ring-primary rounded px-1"/>
+                    </div>
+                    <div className="col-span-1">
+                      <select value={e.journal_code} onChange={ev=>updateEcriture(e.id,"journal_code",ev.target.value)}
+                        className="w-full text-xs bg-transparent border-0 focus:outline-none focus:ring-1 focus:ring-primary rounded">
+                        {JOURNAUX.map(j=><option key={j} value={j}>{j}</option>)}
+                      </select>
+                    </div>
+                    <div className="col-span-1">
+                      <input value={e.compte_numero}
+                        onChange={ev=>updateEcriture(e.id,"compte_numero",ev.target.value)}
+                        className="w-full text-xs font-mono bg-transparent border-0 focus:outline-none focus:ring-1 focus:ring-primary rounded px-1"/>
+                    </div>
+                    <div className="col-span-4">
+                      <input value={e.libelle||""}
+                        onChange={ev=>updateEcriture(e.id,"libelle",ev.target.value)}
+                        className="w-full text-xs bg-transparent border-0 focus:outline-none focus:ring-1 focus:ring-primary rounded px-1"/>
+                    </div>
+                    <div className="col-span-2">
+                      <input type="number" step="0.01" value={e.debit||""}
+                        onChange={ev=>updateEcriture(e.id,"debit",parseFloat(ev.target.value)||0)}
+                        className={`w-full text-xs font-mono text-right bg-transparent border-0 focus:outline-none focus:ring-1 focus:ring-primary rounded px-1 ${e.debit>0?"text-red-600":""}`}/>
+                    </div>
+                    <div className="col-span-2">
+                      <input type="number" step="0.01" value={e.credit||""}
+                        onChange={ev=>updateEcriture(e.id,"credit",parseFloat(ev.target.value)||0)}
+                        className={`w-full text-xs font-mono text-right bg-transparent border-0 focus:outline-none focus:ring-1 focus:ring-primary rounded px-1 ${e.credit>0?"text-green-600":""}`}/>
+                    </div>
+                  </div>
                 ))}
-              </TableBody>
-            </Table>
-          </CardContent></Card>
+              </div>
+
+              {/* Totaux */}
+              <div className="grid grid-cols-12 gap-1 px-3 py-2 bg-muted font-semibold text-xs border-t">
+                <div className="col-span-8">TOTAUX ({ecritures.length} écritures)</div>
+                <div className="col-span-2 text-right text-red-600">{fmt(totalDebit)}</div>
+                <div className="col-span-2 text-right text-green-600">{fmt(totalCredit)}</div>
+              </div>
+            </div>
+          )}
         </TabsContent>
 
-        <TabsContent value="grandlivre">
-          <Input className="mb-4 max-w-xs" placeholder="Rechercher écriture..." value={filterCompte} onChange={e => setFilterCompte(e.target.value)} />
-          <Card><CardContent className="p-0">
-            <Table>
-              <TableHeader><TableRow>
-                <TableHead>Date</TableHead><TableHead>Compte</TableHead><TableHead>Libellé</TableHead>
-                <TableHead className="text-right">Débit</TableHead><TableHead className="text-right">Crédit</TableHead>
-              </TableRow></TableHeader>
-              <TableBody>
-                {filteredEcritures.map(e => (
-                  <TableRow key={e.id}>
-                    <TableCell>{new Date(e.date_ecriture).toLocaleDateString()}</TableCell>
-                    <TableCell className="font-mono">{e.compte_numero}</TableCell>
-                    <TableCell>{e.libelle}</TableCell>
-                    <TableCell className="text-right">{e.debit > 0 ? fmt(e.debit) : ""}</TableCell>
-                    <TableCell className="text-right">{e.credit > 0 ? fmt(e.credit) : ""}</TableCell>
-                  </TableRow>
-                ))}
-              </TableBody>
-            </Table>
-          </CardContent></Card>
-        </TabsContent>
-
-        <TabsContent value="bilan">
-          <div className="grid grid-cols-2 gap-4">
-            <Card>
-              <CardHeader className="bg-blue-50"><CardTitle className="text-sm">ACTIF</CardTitle></CardHeader>
-              <CardContent className="p-0">
-                <Table>
-                  <TableBody>
-                    {Object.entries(grouper(actifItems)).map(([groupe, items]) => (
-                      <>
-                        <TableRow className="bg-muted/50"><TableCell colSpan={2} className="text-xs font-bold">{groupe}</TableCell></TableRow>
-                        {items.map((i: any) => (
-                          <TableRow key={i.numero}><TableCell className="text-sm">{i.intitule}</TableCell><TableCell className="text-right">{fmt(i.montant)}</TableCell></TableRow>
-                        ))}
-                      </>
-                    ))}
-                    <TableRow className="font-bold border-t-2"><TableCell>TOTAL ACTIF</TableCell><TableCell className="text-right">{fmtMAD(totalActif)}</TableCell></TableRow>
-                  </TableBody>
-                </Table>
-              </CardContent>
-            </Card>
-            <Card>
-              <CardHeader className="bg-green-50"><CardTitle className="text-sm">PASSIF</CardTitle></CardHeader>
-              <CardContent className="p-0">
-                <Table>
-                  <TableBody>
-                    {Object.entries(grouper(passifItems)).map(([groupe, items]) => (
-                      <>
-                        <TableRow className="bg-muted/50"><TableCell colSpan={2} className="text-xs font-bold">{groupe}</TableCell></TableRow>
-                        {items.map((i: any) => (
-                          <TableRow key={i.numero}><TableCell className="text-sm">{i.intitule}</TableCell><TableCell className="text-right">{fmt(i.montant)}</TableCell></TableRow>
-                        ))}
-                      </>
-                    ))}
-                    <TableRow><TableCell className="text-sm italic">Résultat Net</TableCell><TableCell className="text-right">{fmt(resultatNet)}</TableCell></TableRow>
-                    <TableRow className="font-bold border-t-2"><TableCell>TOTAL PASSIF</TableCell><TableCell className="text-right">{fmtMAD(totalPassif)}</TableCell></TableRow>
-                  </TableBody>
-                </Table>
-              </CardContent>
-            </Card>
+        {/* ── BALANCE ── */}
+        <TabsContent value="balance" className="mt-4">
+          <div className="rounded-lg border overflow-hidden">
+            <div className="grid grid-cols-10 gap-1 px-4 py-2 bg-muted text-xs font-semibold uppercase text-muted-foreground">
+              <div className="col-span-2">Compte</div>
+              <div className="col-span-3 text-right">Total Débit</div>
+              <div className="col-span-3 text-right">Total Crédit</div>
+              <div className="col-span-1 text-right">Solde</div>
+              <div className="col-span-1 text-center">Sens</div>
+            </div>
+            <div className="max-h-[60vh] overflow-y-auto">
+              {balance.map((l, i) => (
+                <div key={l.compte} className={`grid grid-cols-10 gap-1 px-4 py-1.5 border-b text-sm ${i%2===0?"bg-white dark:bg-background":"bg-muted/20"}`}>
+                  <div className="col-span-2 font-mono font-medium">{l.compte}</div>
+                  <div className="col-span-3 text-right font-mono text-red-600">{l.total_debit>0?fmt(l.total_debit):"—"}</div>
+                  <div className="col-span-3 text-right font-mono text-green-600">{l.total_credit>0?fmt(l.total_credit):"—"}</div>
+                  <div className="col-span-1 text-right font-mono font-semibold">{fmt(l.solde)}</div>
+                  <div className="col-span-1 text-center">
+                    <Badge className={l.sens==="D"?"bg-red-100 text-red-700 text-xs":"bg-green-100 text-green-700 text-xs"}>{l.sens}</Badge>
+                  </div>
+                </div>
+              ))}
+            </div>
+            <div className="grid grid-cols-10 gap-1 px-4 py-2 bg-muted font-semibold text-sm border-t">
+              <div className="col-span-2">TOTAL</div>
+              <div className="col-span-3 text-right font-mono text-red-600">{fmt(totalDebit)}</div>
+              <div className="col-span-3 text-right font-mono text-green-600">{fmt(totalCredit)}</div>
+              <div className="col-span-2 text-right">
+                {equilibre ? <span className="text-green-600 text-xs">✅ Équilibrée</span> : <span className="text-red-600 text-xs">⚠️ {fmt(Math.abs(totalDebit-totalCredit))}</span>}
+              </div>
+            </div>
           </div>
         </TabsContent>
 
-        <TabsContent value="cpc">
-          <div className="grid grid-cols-2 gap-4">
-            <Card>
-              <CardHeader className="bg-green-50"><CardTitle className="text-sm">PRODUITS (7)</CardTitle></CardHeader>
-              <CardContent className="p-0">
-                <Table><TableBody>
-                  {Object.entries(cpcProduits).map(([g, v]: any) => (
-                    <TableRow key={g}><TableCell>{g}</TableCell><TableCell className="text-right">{fmt(v.total)}</TableCell></TableRow>
-                  ))}
-                  <TableRow className="font-bold bg-green-100"><TableCell>TOTAL PRODUITS</TableCell><TableCell className="text-right">{fmtMAD(produitsTotal)}</TableCell></TableRow>
-                </TableBody></Table>
-              </CardContent>
-            </Card>
-            <Card>
-              <CardHeader className="bg-red-50"><CardTitle className="text-sm">CHARGES (6)</CardTitle></CardHeader>
-              <CardContent className="p-0">
-                <Table><TableBody>
-                  {Object.entries(cpcCharges).map(([g, v]: any) => (
-                    <TableRow key={g}><TableCell>{g}</TableCell><TableCell className="text-right">{fmt(v.total)}</TableCell></TableRow>
-                  ))}
-                  <TableRow className="font-bold bg-red-100"><TableCell>TOTAL CHARGES</TableCell><TableCell className="text-right">{fmtMAD(chargesTotal)}</TableCell></TableRow>
-                </TableBody></Table>
-              </CardContent>
-            </Card>
-          </div>
-          <Card className="mt-4 bg-slate-50 border-2"><CardContent className="p-4 flex justify-between items-center font-bold">
-            <span>RÉSULTAT NET DE L'EXERCICE</span>
-            <span className={resultatNet >= 0 ? "text-green-700" : "text-red-700"}>{fmtMAD(resultatNet)}</span>
-          </CardContent></Card>
-        </TabsContent>
+        {/* ── SAISIE MANUELLE ── */}
+        <TabsContent value="saisie" className="mt-4">
+          <Card className="max-w-2xl">
+            <CardContent className="pt-6 space-y-4">
+              <h3 className="font-semibold">Nouvelle écriture manuelle</h3>
+              <div className="grid grid-cols-2 gap-3">
+                <div><label className="text-xs font-medium mb-1 block">Date *</label>
+                  <Input type="date" value={newDate} onChange={e=>setNewDate(e.target.value)}/></div>
+                <div><label className="text-xs font-medium mb-1 block">Journal *</label>
+                  <Select value={newJournal} onValueChange={setNewJournal}>
+                    <SelectTrigger><SelectValue/></SelectTrigger>
+                    <SelectContent>{JOURNAUX.map(j=><SelectItem key={j} value={j}>{j}</SelectItem>)}</SelectContent>
+                  </Select></div>
+                <div><label className="text-xs font-medium mb-1 block">Compte *</label>
+                  <Input value={newCompte} onChange={e=>setNewCompte(e.target.value)} placeholder="3421" list="comptes-list"/>
+                  <datalist id="comptes-list">{COMPTES_COURANTS.map(c=><option key={c} value={c}/>)}</datalist>
+                </div>
+                <div><label className="text-xs font-medium mb-1 block">Réf. pièce</label>
+                  <Input value={newRef} onChange={e=>setNewRef(e.target.value)} placeholder="FAC-001"/></div>
+              </div>
+              <div><label className="text-xs font-medium mb-1 block">Libellé *</label>
+                <Input value={newLibelle} onChange={e=>setNewLibelle(e.target.value)} placeholder="Description de l'écriture"/></div>
+              <div className="grid grid-cols-2 gap-3">
+                <div><label className="text-xs font-medium mb-1 block text-red-600">Débit (MAD)</label>
+                  <Input type="number" step="0.01" value={newDebit||""} onChange={e=>{setNewDebit(parseFloat(e.target.value)||0);if(e.target.value)setNewCredit(0);}}/></div>
+                <div><label className="text-xs font-medium mb-1 block text-green-600">Crédit (MAD)</label>
+                  <Input type="number" step="0.01" value={newCredit||""} onChange={e=>{setNewCredit(parseFloat(e.target.value)||0);if(e.target.value)setNewDebit(0);}}/></div>
+              </div>
+              <Button onClick={ajouterEcriture} disabled={saving} className="w-full">
+                {saving?<Loader2 className="h-4 w-4 mr-2 animate-spin"/>:<Plus className="h-4 w-4 mr-2"/>}
+                Ajouter l'écriture
+              </Button>
+            </CardContent>
+          </Card>
 
-        <TabsContent value="esg">
-          <Card><CardHeader><CardTitle>Soldes de Gestion</CardTitle></CardHeader>
-            <CardContent className="p-0">
-              <Table>
-                <TableBody>
-                  <TableRow><TableCell>Marge Commerciale</TableCell><TableCell className="text-right font-mono">{fmtMAD(produitsTotal * 0.4)}</TableCell></TableRow>
-                  <TableRow className="bg-blue-50 font-bold"><TableCell>Valeur Ajoutée (VA)</TableCell><TableCell className="text-right">{fmtMAD(produitsTotal - chargesTotal * 0.6)}</TableCell></TableRow>
-                  <TableRow className="bg-green-50 font-bold"><TableCell>Excédent Brut d'Exploitation (EBE)</TableCell><TableCell className="text-right">{fmtMAD(resultatNet * 1.2)}</TableCell></TableRow>
-                </TableBody>
-              </Table>
+          {/* Suppression rapide par lot pour les tests */}
+          <Card className="max-w-2xl mt-4 border-red-200">
+            <CardContent className="pt-4 pb-4">
+              <p className="text-sm font-medium text-red-700 mb-3 flex items-center gap-2">
+                <Trash2 className="h-4 w-4"/>Zone de test — Suppression par lot
+              </p>
+              <div className="grid grid-cols-3 gap-2">
+                {JOURNAUX.map(j => (
+                  <Button key={j} variant="outline" size="sm" className="border-red-200 text-red-600 hover:bg-red-50"
+                    onClick={()=>{setDeleteLot({journal:j});setConfirmDelete(true);}}>
+                    Supprimer tout {j}
+                  </Button>
+                ))}
+                <Button variant="destructive" size="sm"
+                  onClick={()=>{setDeleteLot({});setConfirmDelete(true);}}>
+                  ⚠️ Tout supprimer
+                </Button>
+              </div>
             </CardContent>
           </Card>
         </TabsContent>
-
-        <TabsContent value="comptes">
-          <Card><CardContent className="p-0">
-            <Table>
-              <TableHeader><TableRow><TableHead>N°</TableHead><TableHead>Intitulé</TableHead><TableHead>Type</TableHead></TableRow></TableHeader>
-              <TableBody>
-                {comptes.map(c => (
-                  <TableRow key={c.id}>
-                    <TableCell className="font-mono font-bold">{c.numero}</TableCell>
-                    <TableCell>{c.intitule}</TableCell>
-                    <TableCell><Badge variant="secondary">{c.type_compte}</Badge></TableCell>
-                  </TableRow>
-                ))}
-              </TableBody>
-            </Table>
-          </CardContent></Card>
-        </TabsContent>
       </Tabs>
+
+      {/* Confirmation suppression */}
+      <Dialog open={confirmDelete} onOpenChange={setConfirmDelete}>
+        <DialogContent>
+          <DialogHeader><DialogTitle>Confirmer la suppression</DialogTitle></DialogHeader>
+          <div className="text-sm text-muted-foreground">
+            {deleteLot !== null ? (
+              deleteLot.journal||deleteLot.date
+                ? `Supprimer toutes les écritures ${deleteLot.journal?`du journal ${deleteLot.journal}`:""}${deleteLot.date?` du ${deleteLot.date}`:""} ?`
+                : "⚠️ Supprimer TOUTES les écritures comptables de ce dossier ?"
+            ) : (
+              `Supprimer ${deleteIds.size} écriture(s) sélectionnée(s) ?`
+            )}
+            <p className="mt-2 text-red-600 font-medium">Cette action est irréversible.</p>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={()=>{setConfirmDelete(false);setDeleteLot(null);}}>Annuler</Button>
+            <Button variant="destructive" disabled={saving}
+              onClick={deleteLot!==null ? supprimerLot : supprimerSelection}>
+              {saving?<Loader2 className="h-4 w-4 mr-2 animate-spin"/>:<Trash2 className="h-4 w-4 mr-2"/>}
+              Confirmer la suppression
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

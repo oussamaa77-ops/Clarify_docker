@@ -459,7 +459,7 @@ function BanquePage() {
   const load = async () => {
     const [{data:c},{data:r},{data:fc},{data:ff},{data:fo},{data:cl},{data:dos}]=await Promise.all([
       supabase.from("comptes_bancaires").select("*").eq("dossier_id",dossierId).order("created_at"),
-      (supabase as any).from("releves_bancaires").select("*").eq("dossier_id",dossierId).order("created_at",{ascending:false}),
+      (supabase.from("releves_bancaires") as any).select("*").eq("dossier_id",dossierId).order("created_at",{ascending:false}),
       supabase.from("factures").select("id,numero,montant_ttc,montant_ht,montant_tva,date_facture,date_echeance,clients(id,nom,ice)").eq("dossier_id",dossierId).eq("statut","conforme").neq("statut_paiement","payee"),
       (supabase as any).from("factures_fournisseurs").select("id,numero,montant_ttc,montant_ht,montant_tva,date_facture,date_echeance,fournisseur_nom").eq("dossier_id",dossierId).neq("statut_paiement","payee"),
       (supabase as any).from("fournisseurs").select("id,nom,ice").eq("dossier_id",dossierId),
@@ -712,10 +712,35 @@ function BanquePage() {
       }
 
       await supabase.from("ecritures_comptables").insert(ecritures);
-      if(fcPay.length>0) await (supabase.from("factures") as any).update({statut_paiement:"payee",date_paiement:new Date().toISOString().slice(0,10)}).in("id",fcPay);
-      if(ffPay.length>0) await ((supabase.from("factures_fournisseurs") as any) as any).update({statut_paiement:"payee",date_paiement:new Date().toISOString().slice(0,10)}).in("id",ffPay);
+      // Mise à jour statut: partielle si montant payé < montant total, payee sinon
+      for(const fid of fcPay){
+        const fac=facturesClient.find((f:any)=>f.id===fid);
+        const tx=txExtraites.find(t=>t.facture_id===fid);
+        const montantPaye=Math.round(((tx?.montant??0)+(Number(fac?.montant_paye)||0))*100)/100;
+        const montantTotal=Number(fac?.montant_ttc)||0;
+        const estPaye=montantPaye>=montantTotal-0.01;
+        await (supabase.from("factures") as any).update({
+          statut_paiement:estPaye?"payee":"partielle",
+          montant_paye:montantPaye,
+          montant_restant:Math.max(0,Math.round((montantTotal-montantPaye)*100)/100),
+          date_paiement:new Date().toISOString().slice(0,10),
+        }).eq("id",fid);
+      }
+      for(const fid of ffPay){
+        const fac=facturesFourn.find((f:any)=>f.id===fid);
+        const tx=txExtraites.find(t=>t.facture_id===fid);
+        const montantPaye=Math.round(((tx?.montant??0)+(Number(fac?.montant_paye)||0))*100)/100;
+        const montantTotal=Number(fac?.montant_ttc)||0;
+        const estPaye=montantPaye>=montantTotal-0.01;
+        await (supabase.from("factures_fournisseurs") as any).update({
+          statut_paiement:estPaye?"payee":"partielle",
+          montant_paye:montantPaye,
+          montant_restant:Math.max(0,Math.round((montantTotal-montantPaye)*100)/100),
+          date_paiement:new Date().toISOString().slice(0,10),
+        }).eq("id",fid);
+      }
 
-      await (((supabase.from("releves_bancaires") as any) as any) as any).insert({
+      await (supabase.from("releves_bancaires") as any).insert({
         compte_id:releveCompteId,dossier_id:dossierId,
         nombre_transactions:txExtraites.length,
         solde_initial:compte?.solde_actuel??0,
@@ -733,84 +758,107 @@ function BanquePage() {
   };
 
     // ── Génération EDI DGI — format Relevé de Déduction (ADC082F-15I) ──────────────
-  const genererEDI=()=>{
-    // Filtrer uniquement les paiements fournisseurs avec TVA (achats déductibles)
-    const txEligibles=txExtraites.filter(tx=>
-      tx.type==="debit" &&
-      (tx.categorie==="paiement_fournisseur" || PCM_MAP[tx.categorie]?.tva > 0) &&
-      PCM_MAP[tx.categorie]?.tva > 0
-    );
+  const genererEDI=async()=>{
+    // Comptes avec TVA déductible UNIQUEMENT (hors 6147 représentation, 6174 CNSS, 4456 TVA/DGI)
+    const COMPTES_TVA_DEDUCTIBLE=["4411","6122","6125","6131","6132","6141","6145","6146"];
+    const txEligibles=txExtraites.filter(tx=>{
+      const pcm=PCM_MAP[tx.categorie]??{code:"6141",tva:0};
+      return tx.type==="debit"
+        && pcm.tva>0
+        && COMPTES_TVA_DEDUCTIBLE.includes(pcm.code);
+    });
     if(!txEligibles.length){ toast.warning("Aucune transaction éligible à la déduction TVA"); return; }
 
-    // Format date Excel (jours depuis 01/01/1900)
+    const dossierInfo=dossier??{nom_societe:"",ice:"",if_fiscal:""};
+    const annee=new Date().getFullYear();
+    const mois=new Date().getMonth()+1;
+
     const toExcelDate=(dateStr:string):number=>{
       const parts=dateStr.split("/");
       if(parts.length!==3) return 0;
       const d=new Date(`${parts[2]}-${parts[1]}-${parts[0]}`);
       const start=new Date("1899-12-30");
-      return Math.round((d.getTime()-start.getTime())/(86400000));
+      return Math.round((d.getTime()-start.getTime())/86400000);
     };
 
-    // En-tête du fichier EDI DGI (format ADC082F-15I)
-    const dossierInfo=dossier??{nom_societe:"",ice:""};
-    const annee=new Date().getFullYear();
-    const mois=new Date().getMonth()+1;
-
-    // Lignes de données — format exact du template DGI
-    const rows:string[]=[];
-    // En-têtes obligatoires
-    rows.push(`RAISON SOCIAL\t\t${dossierInfo.nom_societe??""}`);
-    rows.push(`ID_FISCAL\t\t${dossierInfo.if_fiscal??""}`);
-    rows.push(`ANNEE\t\t${annee}`);
-    rows.push(`PERIODE(Mois)\t\t${mois}\t\t\tRelevé de déduction`);
-    rows.push(`REGIME(Encais-1)\t\t1`);
-    rows.push(``);
-    rows.push(`OR\tFACT_NUM\tDESIGNATION\tM_HT\tTVA\tM_TTC\tIF\tLIB_FRSS\tICE_FRS\tTAUX\tID_PAIE\tDATE_PAIE\tDATE_FAC`);
-
-    let totalHT=0, totalTVA=0, totalTTC=0;
+    // Construire les données
+    const dataRows:any[][]=[];
+    let totalHT=0,totalTVA=0,totalTTC=0;
 
     txEligibles.forEach((tx,i)=>{
       const pcm=PCM_MAP[tx.categorie]??{code:"6141",tva:20};
       const ht=Math.round(tx.montant/(1+pcm.tva/100)*100)/100;
       const tva=Math.round((tx.montant-ht)*100)/100;
-      // Trouver le fournisseur correspondant
-      const fournisseur=tx.tiers_nom
-        ?(fournisseurs as any[]).find(f=>f.nom?.toUpperCase().includes(tx.tiers_nom!.toUpperCase().slice(0,5)))
+      // Chercher fournisseur par nom tiers
+      const fourn=tx.tiers_nom
+        ?(fournisseurs as any[]).find(f=>f.nom&&f.nom.toUpperCase().includes((tx.tiers_nom||"").toUpperCase().slice(0,5)))
         :null;
-      const dateExcel=toExcelDate(tx.date_operation);
-      // Chercher date facture dans la facture correspondante
       const facFourn=tx.facture_id?(facturesFourn as any[]).find(f=>f.id===tx.facture_id):null;
-      const dateFacExcel=facFourn?toExcelDate(facFourn.date_facture?.split("-").reverse().join("/")||tx.date_operation):dateExcel;
-
+      const datePaieExcel=toExcelDate(tx.date_operation);
+      const dateFacExcel=facFourn
+        ?toExcelDate((facFourn.date_facture||"").split("-").reverse().join("/"))
+        :datePaieExcel;
       totalHT+=ht; totalTVA+=tva; totalTTC+=tx.montant;
-
-      rows.push([
-        String(i+1),
-        tx.reference_facture||`TX-${i+1}`,
+      dataRows.push([
+        i+1,
+        tx.reference_facture||facFourn?.numero||`TX-${i+1}`,
         tx.libelle.slice(0,50),
-        String(Math.round(ht*100)/100),
-        String(Math.round(tva*100)/100),
-        String(tx.montant),
-        fournisseur?.if_fiscal||"",
-        tx.tiers_nom||fournisseur?.nom||"FOURNISSEUR",
-        fournisseur?.ice||"",
-        String(pcm.tva),
-        String(i+1),
-        String(dateExcel),
-        String(dateFacExcel),
-      ].join("\t"));
+        Math.round(ht*100)/100,
+        Math.round(tva*100)/100,
+        tx.montant,
+        fourn?.if_fiscal||"",
+        tx.tiers_nom||fourn?.nom||"",
+        fourn?.ice||"",
+        pcm.tva,
+        i+1,
+        datePaieExcel,
+        dateFacExcel,
+      ]);
     });
 
-    rows.push(`Total\t\t\t${Math.round(totalHT*100)/100}\t${Math.round(totalTVA*100)/100}\t${Math.round(totalTTC*100)/100}`);
+    // Générer Excel avec SheetJS
+    const XLSX=await import("xlsx");
+    const wb=XLSX.utils.book_new();
 
-    const content2=rows.join("\n");
-    const blob=new Blob(["\uFEFF"+content2],{type:"text/tab-separated-values;charset=utf-8;"});
-    const a=document.createElement("a");
-    a.href=URL.createObjectURL(blob);
-    a.download=`EDI_DGI_${dossierInfo.nom_societe?.replace(/\s/g,"_")||"export"}_${annee}_${String(mois).padStart(2,"0")}.txt`;
-    a.click();
-    toast.success(`EDI DGI généré — ${txEligibles.length} lignes déductibles`);
+    // Feuille en-tête DGI
+    const headerData=[
+      ["RAISON SOCIAL","",dossierInfo.nom_societe||""],
+      ["ID_FISCAL","",(dossierInfo as any).if_fiscal||""],
+      ["ANNEE","",annee],
+      [`PERIODE(Mois)`,"",mois,"","","Relevé de déduction"],
+      ["REGIME(Encais-1)","",1],
+      [],
+      ["OR","FACT_NUM","DESIGNATION","M_HT","TVA","M_TTC","IF","LIB_FRSS","ICE_FRS","TAUX","ID_PAIE","DATE_PAIE","DATE_FAC"],
+      ...dataRows,
+      ["Total","","",Math.round(totalHT*100)/100,Math.round(totalTVA*100)/100,Math.round(totalTTC*100)/100],
+    ];
+
+    const ws=XLSX.utils.aoa_to_sheet(headerData);
+
+    // Style colonnes
+    ws['!cols']=[
+      {wch:6},{wch:15},{wch:45},{wch:12},{wch:10},{wch:12},
+      {wch:12},{wch:30},{wch:18},{wch:8},{wch:8},{wch:12},{wch:12},
+    ];
+
+    // Formater les colonnes DATE comme date Excel (DATE_PAIE=col L, DATE_FAC=col M)
+    const dateColL=XLSX.utils.encode_col(11); // L = DATE_PAIE
+    const dateColM=XLSX.utils.encode_col(12); // M = DATE_FAC
+    dataRows.forEach((_,i)=>{
+      const row=i+8; // ligne données commence à 8 (après 7 lignes entête)
+      const cellL=`${dateColL}${row}`;
+      const cellM=`${dateColM}${row}`;
+      if(ws[cellL]) ws[cellL].t="n";
+      if(ws[cellM]) ws[cellM].t="n";
+      if(!ws['!formats']) (ws as any)['!formats']={};
+    });
+
+    XLSX.utils.book_append_sheet(wb,ws,"Relevé Déduction");
+    const nom=`EDI_DGI_${(dossierInfo.nom_societe||"export").replace(/\s/g,"_")}_${annee}_${String(mois).padStart(2,"0")}.xlsx`;
+    XLSX.writeFile(wb,nom);
+    toast.success(`EDI DGI Excel généré — ${txEligibles.length} lignes | HT: ${Math.round(totalHT).toLocaleString("fr-MA")} MAD | TVA: ${Math.round(totalTVA).toLocaleString("fr-MA")} MAD`);
   };
+
 
   const genererBilan=()=>{
     const rows=[["Date","Journal","Compte","Libellé","Débit","Crédit","Catégorie","Réf."]];
@@ -1300,12 +1348,3 @@ function BanquePage() {
     </div>
   );
 }
-
-
-
-
-
-
-
-
-
