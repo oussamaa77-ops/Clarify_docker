@@ -13,9 +13,9 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Plus, FileCode, Eye, CheckCircle, Upload, Loader2, Download, X, AlertCircle, CheckCircle2, UserPlus, Clock, Mail, FileText, Trash2 } from "lucide-react";
 import { toast } from "sonner";
- 
+
 export const Route = createFileRoute("/_app/dossiers/$dossierId/factures")({ component: FacturesPage });
- 
+
 interface Ligne { designation: string; quantite: number; prix_unitaire: number; taux_tva: number }
 interface Client { id: string; nom: string; ice: string | null; email: string | null }
 interface Facture {
@@ -26,7 +26,7 @@ interface Facture {
   xml_ubl: string | null; hash_sha256: string | null; dgi_uuid: string | null; dgi_response: any;
   fichier_original_url: string | null; fichier_original_nom: string | null; fichier_original_type: string | null;
 }
- 
+
 interface OcrData {
   client_nom_extrait: string; ice_client: string | null; numero_facture: string | null;
   date_facture: string | null; date_echeance: string | null; delai_paiement_jours: number | null;
@@ -37,9 +37,9 @@ interface OcrData {
   client_id: string | null; client_action: "found"|"created"|"not_found"; client_trouve: any;
   sens_facture: string; emetteur_nom: string | null;
 }
- 
+
 const fmt = (n: number) => Number(n).toLocaleString("fr-MA", { minimumFractionDigits: 2 }) + " MAD";
- 
+
 function StatutPaiementBadge({ f }: { f: Facture }) {
   if (f.statut_paiement === "payee")
     return <Badge className="bg-green-100 text-green-700 text-xs">✅ Payée</Badge>;
@@ -47,7 +47,7 @@ function StatutPaiementBadge({ f }: { f: Facture }) {
     return <Badge className="bg-blue-100 text-blue-700 text-xs">🔵 Acompte partiel</Badge>;
   return <Badge variant="secondary" className="text-xs">En attente</Badge>;
 }
- 
+
 function DGIBadge({ statut, statut_dgi }: { statut: string; statut_dgi: string | null }) {
   if (statut_dgi === "en_analyse" || statut === "envoyee")
     return <Badge className="bg-yellow-100 text-yellow-800 text-xs flex items-center gap-1"><Clock className="h-3 w-3"/>En analyse</Badge>;
@@ -57,14 +57,14 @@ function DGIBadge({ statut, statut_dgi }: { statut: string; statut_dgi: string |
     return <Badge variant="destructive" className="text-xs">❌ Rejeté</Badge>;
   return <Badge variant="secondary" className="text-xs">{statut}</Badge>;
 }
- 
+
 function FacturesPage() {
   const { dossierId } = Route.useParams();
   const genXml = useServerFn(generateFactureXml);
   const payFn  = useServerFn(marquerPayee);
   const ocrFn  = useServerFn(ocrFacture);
   const addEmailFn = useServerFn(ajouterEmailClient);
- 
+
   const [factures, setFactures] = useState<Facture[]>([]);
   const [clients, setClients]   = useState<Client[]>([]);
   const [loading, setLoading]   = useState(true);
@@ -73,10 +73,10 @@ function FacturesPage() {
   const [dgiResult, setDgiResult] = useState<any>(null);
   const [processing, setProcessing] = useState<string | null>(null);
   const [deleteConfirm, setDeleteConfirm] = useState<string | null>(null);
- 
+
   const [emailModal, setEmailModal] = useState<{clientId:string;factureId:string}|null>(null);
   const [emailInput, setEmailInput] = useState("");
- 
+
   // Formulaire
   const [clientId, setClientId]   = useState("");
   const [numero, setNumero]       = useState("");
@@ -87,13 +87,13 @@ function FacturesPage() {
   const [montantPaye, setMontantPaye]     = useState(0);
   const [montantRestant, setMontantRestant] = useState(0);
   const [lignes, setLignes] = useState<Ligne[]>([{designation:"",quantite:1,prix_unitaire:0,taux_tva:20}]);
- 
+
   // OCR
   const [ocrLoading, setOcrLoading] = useState(false);
   const [ocrData, setOcrData]       = useState<OcrData|null>(null);
   const [originalFile, setOriginalFile] = useState<File|null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
- 
+
   const load = async () => {
     setLoading(true);
     const [{data:f},{data:c}] = await Promise.all([
@@ -105,27 +105,27 @@ function FacturesPage() {
     setLoading(false);
   };
   useEffect(()=>{load();},[dossierId]);
- 
+
   const ht  = lignes.reduce((s,l)=>s+l.quantite*l.prix_unitaire,0);
   const tva = lignes.reduce((s,l)=>s+l.quantite*l.prix_unitaire*l.taux_tva/100,0);
   const ttc = ht+tva;
- 
+
   const setLigne=(i:number,f:keyof Ligne,v:any)=>
     setLignes(ls=>ls.map((l,j)=>j===i?{...l,[f]:v}:l));
- 
+
   // Mise à jour automatique montant_restant quand ttc change
   useEffect(()=>{
     if(typeFacture==="standard") { setMontantPaye(0); setMontantRestant(ttc); }
     else if(typeFacture==="acompte") { setMontantRestant(Math.max(0,ttc-montantPaye)); }
   },[ttc,typeFacture]);
- 
+
   const handleOcr = async (file: File) => {
     setOcrLoading(true); setOcrData(null); setOriginalFile(file);
     try {
       let extractedText=""; let image_base64:string|undefined; const mime_type=file.type||"application/octet-stream";
       const isPdf=file.type==="application/pdf"||file.name.toLowerCase().endsWith(".pdf");
       const isImage=file.type.startsWith("image/");
- 
+
       if(isPdf) {
         const pdfjsLib=await import("pdfjs-dist");
         pdfjsLib.GlobalWorkerOptions.workerSrc=`https://unpkg.com/pdfjs-dist@${pdfjsLib.version}/build/pdf.worker.min.mjs`;
@@ -163,11 +163,11 @@ function FacturesPage() {
           r.onerror=rej; r.readAsDataURL(file);
         });
       } else { extractedText=await file.text(); }
- 
+
       const result=await ocrFn({data:{extracted_text:extractedText,image_base64,mime_type,dossier_id:dossierId}});
       const r=result.result as OcrData;
       setOcrData(r);
- 
+
       // Pré-remplir formulaire
       if(r.client_id) setClientId(r.client_id);
       if(r.numero_facture) setNumero(r.numero_facture);
@@ -180,7 +180,7 @@ function FacturesPage() {
       }
       if(r.mode_reglement) setModeReglement(r.mode_reglement);
       setTypeFacture(r.type_facture??"standard");
- 
+
       // Montants selon type
       if(r.type_facture==="acompte") {
         setMontantPaye(r.montant_ttc??0);
@@ -189,17 +189,17 @@ function FacturesPage() {
         setMontantPaye(0);
         setMontantRestant(r.montant_ttc??0);
       }
- 
+
       if(r.lignes?.length) setLignes(r.lignes);
- 
+
       if(r.client_action==="created"){await load();toast.success(`Client "${r.client_nom_extrait}" créé`);}
       else if(r.client_action==="found") toast.success(`Client "${r.client_trouve?.nom}" identifié`);
       else toast.warning("Client non identifié — sélectionnez manuellement");
- 
+
     } catch(e:any){toast.error("Erreur OCR: "+e.message);}
     finally{setOcrLoading(false);}
   };
- 
+
   const handleCreate = async () => {
     if(!clientId) return toast.error("Sélectionnez un client");
     if(!lignes[0].designation) return toast.error("Ajoutez au moins une ligne");
@@ -217,7 +217,7 @@ function FacturesPage() {
       created_by:authData?.user?.id??null,
     }).select().single();
     if(error) return toast.error(error.message);
- 
+
     if(originalFile&&newFact){
       const ext=originalFile.name.split(".").pop();
       const path=`${dossierId}/${newFact.id}.${ext}`;
@@ -231,31 +231,34 @@ function FacturesPage() {
         }).eq("id",newFact.id);
       }
     }
- 
+
     toast.success("Facture créée");
     setOpenCreate(false);
     resetForm();
     load();
   };
- 
+
   const resetForm=()=>{
     setOcrData(null);setOriginalFile(null);
     setLignes([{designation:"",quantite:1,prix_unitaire:0,taux_tva:20}]);
     setClientId("");setNumero("");setDateE("");setTypeFacture("standard");
     setMontantPaye(0);setMontantRestant(0);setModeReglement("virement");
   };
- 
+
   const handleDelete = async (factureId: string) => {
     try {
-      await supabase.from("ecritures_comptables").delete().eq("facture_id",factureId);
-      const{error}=await supabase.from("factures").delete().eq("id",factureId);
-      if(error) throw error;
+      // Supprimer dans l'ordre des dépendances (clés étrangères)
+      await supabase.from("ged_documents" as any).delete().eq("facture_id", factureId);
+      await supabase.from("ecritures_comptables").delete().eq("facture_id", factureId);
+      await supabase.from("transactions_bancaires" as any).delete().eq("facture_id", factureId);
+      const { error } = await supabase.from("factures").delete().eq("id", factureId);
+      if (error) throw error;
       toast.success("Facture supprimée");
       setDeleteConfirm(null);
       load();
-    } catch(e:any){toast.error(e.message);}
+    } catch(e:any) { toast.error(e.message); }
   };
- 
+
   const handleGenXml = async (f: Facture) => {
     const client=clients.find(c=>c.id===f.client_id);
     if(!client?.email){setEmailModal({clientId:f.client_id!,factureId:f.id});toast.warning("Email client manquant");return;}
@@ -269,7 +272,7 @@ function FacturesPage() {
     }catch(e:any){toast.error(e.message);}
     finally{setProcessing(null);}
   };
- 
+
   const handleGenXmlSansEmail = async (fid: string) => {
     setProcessing(fid);setEmailModal(null);
     try{
@@ -281,7 +284,7 @@ function FacturesPage() {
     }catch(e:any){toast.error(e.message);}
     finally{setProcessing(null);}
   };
- 
+
   const handleAddEmail = async () => {
     if(!emailModal||!emailInput) return;
     try{
@@ -292,7 +295,7 @@ function FacturesPage() {
       if(f){setEmailModal(null);setEmailInput("");handleGenXmlSansEmail(f.id);}
     }catch(e:any){toast.error(e.message);}
   };
- 
+
   const handlePay = async (fid: string) => {
     setProcessing(fid);
     try{
@@ -302,13 +305,13 @@ function FacturesPage() {
     }catch(e:any){toast.error(e.message);}
     finally{setProcessing(null);}
   };
- 
+
   // KPIs
   const conformes  = factures.filter(f=>f.statut==="conforme");
   const caHT       = conformes.reduce((s,f)=>s+Number(f.montant_ht),0);
   const encours    = conformes.filter(f=>f.statut_paiement!=="payee").reduce((s,f)=>s+Number(f.montant_restant||f.montant_ttc),0);
   const enAnalyse  = factures.filter(f=>f.statut==="envoyee"||f.statut_dgi==="en_analyse").length;
- 
+
   return (
     <div className="p-8 max-w-7xl mx-auto">
       <div className="flex items-center justify-between mb-6">
@@ -320,7 +323,7 @@ function FacturesPage() {
           <DialogTrigger asChild><Button><Plus className="h-4 w-4 mr-2"/>Nouvelle facture</Button></DialogTrigger>
           <DialogContent className="max-w-5xl max-h-[92vh] overflow-y-auto">
             <DialogHeader><DialogTitle>Créer une facture</DialogTitle></DialogHeader>
- 
+
             <div className="grid grid-cols-2 gap-6">
               {/* Gauche: Upload OCR */}
               <div className="space-y-4">
@@ -336,7 +339,7 @@ function FacturesPage() {
                     :<><Upload className="h-8 w-8 mx-auto mb-2 text-muted-foreground opacity-50"/><p className="text-sm font-medium">Glissez une facture PDF / image</p><p className="text-xs text-muted-foreground mt-1">Extraction automatique des données</p></>
                   }
                 </div>
- 
+
                 {ocrData && (
                   <div className="space-y-2 text-sm">
                     <div className="flex items-center gap-2">
@@ -354,7 +357,7 @@ function FacturesPage() {
                         <p><span className="text-muted-foreground">Type:</span> <Badge className="text-xs bg-blue-100 text-blue-700">{ocrData.type_facture}</Badge></p>
                       )}
                     </div>
- 
+
                     {/* Lignes détectées */}
                     {ocrData.lignes?.length>0&&(
                       <div className="rounded border overflow-hidden">
@@ -371,11 +374,11 @@ function FacturesPage() {
                   </div>
                 )}
               </div>
- 
+
               {/* Droite: Formulaire éditable */}
               <div className="space-y-4">
                 <h3 className="font-semibold text-sm">✏️ Données de la facture</h3>
- 
+
                 <div className="space-y-2">
                   <Label>Client *</Label>
                   <Select value={clientId} onValueChange={setClientId}>
@@ -383,7 +386,7 @@ function FacturesPage() {
                     <SelectContent>{clients.map(c=><SelectItem key={c.id} value={c.id}>{c.nom}</SelectItem>)}</SelectContent>
                   </Select>
                 </div>
- 
+
                 <div className="grid grid-cols-2 gap-3">
                   <div className="space-y-2"><Label>N° Facture</Label><Input value={numero} onChange={e=>setNumero(e.target.value)} placeholder="FA-001"/></div>
                   <div className="space-y-2">
@@ -401,7 +404,7 @@ function FacturesPage() {
                   <div className="space-y-2"><Label>Date facture</Label><Input type="date" value={dateF} onChange={e=>setDateF(e.target.value)}/></div>
                   <div className="space-y-2"><Label>Date échéance (défaut +30j)</Label><Input type="date" value={dateE} onChange={e=>setDateE(e.target.value)}/></div>
                 </div>
- 
+
                 <div className="space-y-2">
                   <Label>Mode de règlement</Label>
                   <Select value={modeReglement} onValueChange={setModeReglement}>
@@ -415,7 +418,7 @@ function FacturesPage() {
                     </SelectContent>
                   </Select>
                 </div>
- 
+
                 {/* Lignes */}
                 <div>
                   <div className="flex items-center justify-between mb-2">
@@ -440,7 +443,7 @@ function FacturesPage() {
                     HT: {fmt(ht)} · TVA: {fmt(tva)} · <strong>TTC: {fmt(ttc)}</strong>
                   </div>
                 </div>
- 
+
                 {/* Montants payé / restant */}
                 <div className="p-3 bg-blue-50 dark:bg-blue-950/20 rounded-lg border border-blue-200 space-y-3">
                   <p className="text-xs font-semibold text-blue-700">Suivi du paiement</p>
@@ -466,7 +469,7 @@ function FacturesPage() {
                 </div>
               </div>
             </div>
- 
+
             <DialogFooter className="mt-4">
               <Button variant="outline" onClick={()=>{setOpenCreate(false);resetForm();}}>Annuler</Button>
               <Button onClick={handleCreate}>Créer la facture</Button>
@@ -474,7 +477,7 @@ function FacturesPage() {
           </DialogContent>
         </Dialog>
       </div>
- 
+
       {/* KPIs */}
       <div className="grid grid-cols-4 gap-4 mb-6">
         {[
@@ -489,7 +492,7 @@ function FacturesPage() {
           </CardContent></Card>
         ))}
       </div>
- 
+
       {/* Table */}
       <Card><CardContent className="p-0">
         <Table>
@@ -550,7 +553,7 @@ function FacturesPage() {
           </TableBody>
         </Table>
       </CardContent></Card>
- 
+
       {/* Modal email manquant */}
       <Dialog open={!!emailModal} onOpenChange={()=>{setEmailModal(null);setEmailInput("");}}>
         <DialogContent>
@@ -567,7 +570,7 @@ function FacturesPage() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
- 
+
       {/* Modal confirmation suppression */}
       <Dialog open={!!deleteConfirm} onOpenChange={()=>setDeleteConfirm(null)}>
         <DialogContent>
@@ -581,7 +584,7 @@ function FacturesPage() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
- 
+
       {/* DGI Result */}
       <Dialog open={!!dgiResult} onOpenChange={()=>setDgiResult(null)}>
         <DialogContent>
@@ -601,7 +604,7 @@ function FacturesPage() {
           <DialogFooter><Button onClick={()=>setDgiResult(null)}>Fermer</Button></DialogFooter>
         </DialogContent>
       </Dialog>
- 
+
       {/* XML Viewer */}
       <Dialog open={!!viewXml} onOpenChange={()=>setViewXml(null)}>
         <DialogContent className="max-w-3xl">
@@ -617,5 +620,6 @@ function FacturesPage() {
     </div>
   );
 }
+
 
 

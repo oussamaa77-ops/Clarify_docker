@@ -10,383 +10,366 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { Plus, Landmark, Upload, Loader2, TrendingUp, TrendingDown, CheckCircle, FileText, AlertCircle, RefreshCw, Download, X, Sparkles } from "lucide-react";
+import { Plus, Landmark, Upload, Loader2, TrendingUp, TrendingDown, CheckCircle, FileText, AlertCircle, RefreshCw, Download, X, Sparkles, Eye } from "lucide-react";
 import { toast } from "sonner";
-import { createServerFn } from "@tanstack/react-start";
-import { z } from "zod";
 import { useServerFn } from "@tanstack/react-start";
- 
+import { analyserReleveIA } from "@/server/factures.functions";
+
 export const Route = createFileRoute("/_app/dossiers/$dossierId/banque")({
   component: BanquePage,
 });
- 
+
 const fmt = (n: number) => Number(n).toLocaleString("fr-MA", { minimumFractionDigits: 2 }) + " MAD";
- 
+
 // ─── Types ────────────────────────────────────────────────────────────────────
 interface Compte { id: string; banque: string | null; intitule: string | null; rib: string | null; solde_actuel: number; }
 interface TxBancaire { id: string; date_operation: string; libelle: string | null; type: string; montant: number; solde_apres: number | null; rapproche: boolean; }
 interface Releve { id: string; fichier_nom: string | null; statut: string; nombre_transactions: number; solde_initial: number; solde_final: number; created_at: string; }
 interface FactureNonPayee { id: string; type: "client" | "fournisseur"; numero: string | null; nom: string; montant_ttc: number; date_echeance: string | null; }
- 
+
 interface TxExtracted {
   date_operation: string; date_valeur: string; reference: string;
   libelle: string; type: "credit" | "debit"; montant: number;
   categorie: string; compte_comptable: string;
   reference_facture: string | null; confiance: number;
   facture_id: string | null; alerte: string | null;
+  tiers_nom: string | null; etape_rapprochement: string;
 }
- 
+
 interface InfoReleve { banque: string; rib: string; solde_initial: number; solde_final: number; }
- 
+
 // ─── Server function : analyse Gemini → catégorisation + matching ─────────────
-export const analyserReleveIA = createServerFn({ method: "POST" })
-  .inputValidator((input: unknown) => z.object({
-    transactions_brutes: z.array(z.any()),
-    factures_client: z.array(z.any()),
-    factures_fourn: z.array(z.any()),
-    clients: z.array(z.any()),
-    fournisseurs: z.array(z.any()),
-    dossier_nom: z.string().default(""),
-    dossier_ice: z.string().default(""),
-    remarques: z.string().optional(),
-  }).parse(input))
-  .handler(async ({ data }) => {
-    const geminiKey = process.env.GEMINI_API_KEY;
-    const groqKey   = process.env.GROQ_API_KEY;
- 
-    const prompt = `Tu es expert-comptable marocain certifié (PCM/CGNC). Analyse ces transactions bancaires.
- 
-SOCIÉTÉ DU DOSSIER: "${data.dossier_nom}" (ICE: ${data.dossier_ice || "non renseigné"})
-CRÉDITS = encaissements. DÉBITS = paiements ou charges.
- 
-FACTURES CLIENTS NON ENCAISSÉES:
-${JSON.stringify(data.factures_client.map((f: any) => ({ id: f.id, num: f.numero, client: f.clients?.nom, ttc: Number(f.montant_ttc), ht: Number(f.montant_ht), echeance: f.date_echeance })))}
- 
-FACTURES FOURNISSEURS NON PAYÉES:
-${JSON.stringify(data.factures_fourn.map((f: any) => ({ id: f.id, num: f.numero, fournisseur: f.fournisseur_nom, ttc: Number(f.montant_ttc), ht: Number(f.montant_ht), echeance: f.date_echeance })))}
- 
-CLIENTS: ${JSON.stringify(data.clients.map((c: any) => ({ nom: c.nom, ice: c.ice })))}
-FOURNISSEURS: ${JSON.stringify(data.fournisseurs.map((f: any) => ({ nom: f.nom, ice: f.ice })))}
-${data.remarques ? `REMARQUES (PRIORITÉ ABSOLUE):\n${data.remarques}\n` : ""}
- 
-TRANSACTIONS À ANALYSER:
-${JSON.stringify(data.transactions_brutes.map((tx: any, i: number) => ({ i, date: tx.date_operation, libelle: tx.libelle, debit: tx.montant_debit, credit: tx.montant_credit })))}
- 
-ALGORITHME (ordre strict):
-1. REMARQUES COMPTABLE → confiance 100%
-2. NUMÉRO FACTURE dans libellé → confiance 95%, retourner facture_id UUID
-3. NOM TIERS dans libellé (3+ lettres communes, tolérer abréviations) → confiance 85%
-4. MONTANT TTC EXACT ±1 MAD + date ≤ echeance+15j → confiance 80%, retourner facture_id
-5. MOTS-CLÉS PCM marocain:
-   CNSS|AMO→6174(0%) | TVA|DGI|IR|IS→4456(0%) | SALAIRE→6171(0%)
-   IAM|INWI|ORANGE|TELECOM→6132(20%) | LOYER|LOCATION→6131(20%)
-   GASOIL|CARBURANT→6122(20%) | EAU|ONEE|AMENAU→6125(7%)
-   ASSURANCE→6161(0%) | COMMISSION|FRAIS BANC→6347(10%)
-   RETRAIT|GAB|ESPECES→5161(0%) | IMPORT|DOUANE→6146(0%)
-   RESTAURANT|LOUNG|CAFE→6147(0%) | ENTRETIEN|REPARATION→6141(20%)
-   TRANSPORT|DEPLACEMENT→6145(0%) → confiance 75%
-6. DIRECTION: credit→encaissement_client/3421, debit→paiement_fournisseur/4411 → confiance 60%
-7. INCONNU → alerte avec message pour comptable
- 
-Réponds UNIQUEMENT avec ce JSON:
-{"analyses":[{"i":0,"categorie":"encaissement_client|paiement_fournisseur|salaires|cnss_amo|tva_dgi|loyers|eau_electricite|telecom|gasoil|assurance|entretien|frais_bancaires|frais_representation|frais_douane|retrait_especes|interets_crediteurs|autre","code_pcm":"string","tiers_nom":"string|null","facture_num":"string|null","facture_id":"string|null","montant_ht":null,"montant_tva":null,"taux_tva":0,"confiance":0,"alerte":"string|null","necessite_remarque":false}]}`;
- 
-    // Tenter Gemini d'abord, fallback Groq
-    let content = "";
-    if (geminiKey) {
-      try {
-        const res = await fetch(
-          `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${geminiKey}`,
-          { method: "POST", headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }], generationConfig: { response_mime_type: "application/json", temperature: 0 } }) }
-        );
-        if (res.ok) {
-          const d = await res.json();
-          content = d.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
-          console.log("[RELEVE AI] Gemini OK");
-        } else { console.log("[RELEVE AI] Gemini", res.status, "→ fallback Groq"); }
-      } catch(e) { console.log("[RELEVE AI] Gemini exception → fallback Groq"); }
-    }
- 
-    if (!content && groqKey) {
-      const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-        method: "POST",
-        headers: { Authorization: `Bearer ${groqKey}`, "Content-Type": "application/json" },
-        body: JSON.stringify({ model: "llama-3.3-70b-versatile", temperature: 0, max_tokens: 4000, messages: [{ role: "user", content: prompt }], response_format: { type: "json_object" } }),
-      });
-      if (res.ok) {
-        const d = await res.json() as any;
-        content = d.choices[0].message.content;
-        console.log("[RELEVE AI] Groq OK");
-      }
-    }
- 
-    if (!content) throw new Error("Aucune API IA disponible");
-    content = content.replace(/```json\n?/g, "").replace(/```\n?/g, "").trim();
-    return JSON.parse(content) as { analyses: any[] };
-  });
- 
-// ─── Parser ATW universel — gère lignes complètes ET fragmentées ─────────────────
-// Adapté de awb_line_to_tx + bp_split_line (Python parser fourni)
- 
+
+
+// ─── Helpers (portés exactement de bank_statement_parser_BP_ATTIJARI_PROPRE.py) ──
+
+const AMOUNT_RE_STR = String.raw`\d{1,3}(?:[\s.]?\d{3})*[,.]\s*\d{2}|\d+[,.]\s*\d{2}`;
+const AMOUNT_RE = new RegExp(AMOUNT_RE_STR, 'g');
+
 const OCR_FIXES: Record<string,string> = {
   "C0MMISSI0N":"COMMISSION","C0MMISSION":"COMMISSION","COMMISSI0N":"COMMISSION",
   "S0CIETE":"SOCIETE","D0CUMENT":"DOCUMENT","C0MPTE":"COMPTE",
   "M0NETIQUE":"MONETIQUE","CHE0UE":"CHEQUE","CHE0UES":"CHEQUES",
 };
- 
-function cleanNature(t:string):string {
-  if(!t) return "";
-  let s=t.toUpperCase().replace(/\s+/g," ").trim();
-  for(const[a,b] of Object.entries(OCR_FIXES)) s=s.split(a).join(b);
-  s=s.replace(/(?<=[A-Z])0(?=[A-Z])/g,"O");
-  return s.trim();
+
+function norm(s: string): string {
+  if (!s) return "";
+  s = String(s).replace(/[|\[\]{}!]/g, " ");
+  return s.replace(/\s+/g, " ").trim();
 }
- 
-function cleanAmount(s:string):number|null {
-  if(!s) return null;
-  let v=s.replace(/ /g," ").replace(/O/gi,"0").replace(/[^\d,.\s]/g,"");
-  v=v.replace(/\s/g,"");
-  if(!v) return null;
-  if(v.endsWith(",")||v.endsWith(".")) v+="00";
-  if(v.includes(",")) v=v.replace(/\./g,"").replace(",",".");
-  const n=parseFloat(v);
-  return isNaN(n)||n<=0?null:Math.round(n*100)/100;
+
+function cleanAmount(s: string): number | null {
+  if (!s) return null;
+  let v = s.replace(/\xa0/g," ").replace(/O/gi,"0").replace(/[^\d,.\s]/g,"");
+  v = v.replace(/\s/g,"");
+  if (!v) return null;
+  if (v.endsWith(",") || v.endsWith(".")) v += "00";
+  if (v.includes(",")) v = v.replace(/\./g,"").replace(",",".");
+  const n = parseFloat(v);
+  return isNaN(n) || n <= 0 ? null : Math.round(n * 100) / 100;
 }
- 
-const CREDIT_KW=["RECU","REÇU","REMISE CHEQUE","REMISE CHQ","VERSEMENT RECU",
-  "VIR.WEB RECU","VIR INST RECU","INTERETS CREDIT","AVIS DE CREDIT","DEPOT"];
- 
-function looksCredit(n:string):boolean {
-  const u=(n||"").toUpperCase();
-  return CREDIT_KW.some(k=>u.includes(k));
+
+function cleanDateParts(d: string, m: string, y: string): string | null {
+  try {
+    const dd = parseInt(d.replace(/O/gi,"0"));
+    const mm = parseInt(m.replace(/O/gi,"0"));
+    const yy = parseInt(y.replace(/O/gi,"0"));
+    if (isNaN(dd)||isNaN(mm)||isNaN(yy)) return null;
+    return `${String(dd).padStart(2,"0")}/${String(mm).padStart(2,"0")}/${yy}`;
+  } catch { return null; }
 }
- 
-const AMOUNT_RE=/(\d{1,3}(?:\s\d{3})*,\d{2})/g;
-const ATW_CODE=/^([A-Z0-9]{5,7})\s+(\d{2})\s+(\d{2})\s*(.*)$/;
-const DATE_VAL_RE=/(\d{2})\s+(\d{2})\s+(20\d{2})/g;
-const PURE_DATE=/^\s*(\d{2})\s+(\d{2})\s+(\d{4})\s*$/;
-const PURE_AMT=/^\s*(\d{1,3}(?:\s\d{3})*,\d{2})\s*$/;
- 
-const EXCL_PARSER=["solde depart","solde final","total mouvements","attijariwafa bank",
-  "banque populaire","cih bank","bmce","bmci","agence","page","morocco","casablanca",
-  "dirham","rc 333","cnss 9","ice 00","capital","privatisation","arrêté","décembre",
-  "dar al","angle bd","lalla","releve d","extrait de","code banque","titulaire",
-  "date oper","libelle","debit","credit","montant","www.","sa au capital"];
- 
-function parserATW(lines:string[], year:number): any[] {
-  const txs:any[]=[];
- 
-  // Identifier lignes avec code ATW et lignes sans
-  const codeLines:{idx:number;code:string;d1:string;m1:string;rest:string}[]=[];
-  const otherLines:{idx:number;content:string}[]=[];
- 
-  lines.forEach((line,idx)=>{
-    const low=line.toLowerCase();
-    if(EXCL_PARSER.some(e=>low.includes(e))) return;
-    if(line.length<2) return;
- 
-    const m=ATW_CODE.exec(line.trim());
-    if(m&&parseInt(m[2])<=31&&parseInt(m[3])<=12) {
-      codeLines.push({idx,code:m[1],d1:m[2],m1:m[3],rest:m[4].trim()});
-    } else {
-      otherLines.push({idx,content:line.trim()});
-    }
-  });
- 
-  let i=0;
-  while(i<codeLines.length) {
-    const {idx,code,d1,m1,rest}=codeLines[i];
- 
-    // Vérifier si ligne complète (a date valeur ET montant)
-    const datesInRest=[...rest.matchAll(DATE_VAL_RE)];
-    const amtsInRest=[...rest.matchAll(AMOUNT_RE)];
- 
-    if(datesInRest.length>0&&amtsInRest.length>0) {
-      // Ligne complète
-      const dm=datesInRest[datesInRest.length-1];
-      const amount=cleanAmount(amtsInRest[amtsInRest.length-1][0]);
-      let libelle=rest
-        .replace(DATE_VAL_RE,"")
-        .replace(AMOUNT_RE,"")
-        .replace(/-\s*$/,"")
-        .replace(/\s+/g," ").trim();
-      libelle=cleanNature(libelle);
-      if(amount&&amount>0) {
-        const cr=looksCredit(libelle);
-        txs.push({
-          ligne:txs.length+1,
-          date_operation:`${d1}/${m1}/${year}`,
-          date_valeur:`${dm[1]}/${dm[2]}/${dm[3]}`,
-          reference:code,
-          libelle:libelle||"Transaction",
-          montant_debit:cr?null:amount,
-          montant_credit:cr?amount:null,
-        });
-      }
-      i++;
-    } else {
-      // Lignes fragmentées — regrouper
-      const fragCodes:[number,string,string,string][]=[];
-      let j=i;
-      while(j<codeLines.length) {
-        const {idx:ci,code:cc,d1:cd1,m1:cm1,rest:crest}=codeLines[j];
-        const cd=[...crest.matchAll(DATE_VAL_RE)];
-        const ca=[...crest.matchAll(AMOUNT_RE)];
-        if(cd.length>0&&ca.length>0) break;
-        fragCodes.push([ci,cc,cd1,cm1]);
-        j++;
-      }
-      const nextCodeIdx=j<codeLines.length?codeLines[j].idx:lines.length;
-      const firstFragIdx=fragCodes[0][0];
- 
-      // Collecter lignes "autres" dans cette zone
-      const zoneOthers=otherLines.filter(o=>o.idx>firstFragIdx&&o.idx<nextCodeIdx);
- 
-      const libelles:string[]=[];
-      const datesZone:string[]=[];
-      const amountsZone:number[]=[];
- 
-      zoneOthers.forEach(({content})=>{
-        if(PURE_DATE.test(content)) {
-          const dm=PURE_DATE.exec(content)!;
-          datesZone.push(`${dm[1]}/${dm[2]}/${dm[3]}`);
-        } else if(PURE_AMT.test(content)) {
-          const a=cleanAmount(PURE_AMT.exec(content)![1]);
-          if(a) amountsZone.push(a);
-        } else if(content&&!EXCL_PARSER.some(e=>content.toLowerCase().includes(e))) {
-          libelles.push(content);
-        }
-      });
- 
-      fragCodes.forEach(([,fc,fd1,fm1],k)=>{
-        const lib=cleanNature(libelles[k]||"Transaction");
-        const dv=datesZone[k]||`${fd1}/${fm1}/${year}`;
-        const amt=amountsZone[k]||null;
-        if(amt&&amt>0) {
-          const cr=looksCredit(lib);
-          txs.push({
-            ligne:txs.length+1,
-            date_operation:`${fd1}/${fm1}/${year}`,
-            date_valeur:dv,
-            reference:fc,
-            libelle:lib,
-            montant_debit:cr?null:amt,
-            montant_credit:cr?amt:null,
-          });
-        }
-      });
-      i=j;
-    }
+
+function cleanNatureText(text: string): string {
+  if (!text) return "";
+  let t = norm(text).toUpperCase();
+  for (const [a,b] of Object.entries(OCR_FIXES)) t = t.split(a).join(b);
+  t = t.replace(/(?<=[A-Z])0(?=[A-Z])/g, "O");
+  return t.replace(/\s+/g," ").trim();
+}
+
+function looksCredit(nature: string): boolean {
+  const u = (nature||"").toUpperCase();
+  return ["RECU","REÇU","REMISE","VERSEMENT RECU","VIR.WEB RECU","VIR INST RECU"].some(k => u.includes(k));
+}
+
+// ── awb_line_to_tx — porté EXACTEMENT de bank_statement_parser_BP_ATTIJARI_PROPRE.py ──
+function awbLineToTx(line: string, year: number): any | null {
+  const raw = norm(line).replace(/@/g,"0");
+  let pr = raw.replace(/O/g,"0").replace(/o/g,"0");
+  pr = pr.replace(/(?<=[A-Z0-9])[lI](?=\d{2}\s+\d{2})/g," ").replace(/\//g," ");
+
+  let m = pr.match(/^(?<code>[A-Z0-9]{6,7})\s*(?<d1>\d{2})\s+(?<m1>\d{2})\s+(?<rest>.+)$/i);
+  if (!m) m = pr.match(/^(?<code>[A-Z0-9]{6})(?<d1>\d{2})\s+(?<m1>\d{2})\s+(?<rest>.+)$/i);
+  if (!m?.groups) return null;
+
+  const code = m.groups.code.toUpperCase();
+  const d1 = m.groups.d1, m1 = m.groups.m1;
+  const rest = norm(m.groups.rest);
+
+  const dateMatches = [...rest.matchAll(/(\d{2})\s+(\d{2})\s+(20\d{2})/g)];
+  if (!dateMatches.length) return null;
+  const dm = dateMatches[dateMatches.length - 1];
+  const d2 = dm[1], m2 = dm[2], y2 = dm[3];
+
+  const dmIdx = dm.index!;
+  let nature = cleanNatureText(rest.slice(0, dmIdx));
+  const tail = norm(rest.slice(dmIdx + dm[0].length));
+
+  let amounts = [...tail.matchAll(new RegExp(AMOUNT_RE_STR,"g"))].map(a => a[0]);
+  let amount = amounts.length ? cleanAmount(amounts[0]) : null;
+
+  if (amount === null) {
+    amounts = [...rest.matchAll(new RegExp(AMOUNT_RE_STR,"g"))].map(a => a[0]);
+    amount = amounts.length ? cleanAmount(amounts[0]) : null;
+    if (amounts.length) nature = cleanNatureText(nature.replace(amounts[0],""));
   }
-  return txs;
-}
- 
-// Parser BP/BMCE/BMCI: DD MM YYYY DD MM YYYY LIBELLE MONTANT
-function parserBP(lines:string[], year:number): any[] {
-  const txs:any[]=[];
-  for(const line of lines) {
-    const low=line.toLowerCase();
-    if(EXCL_PARSER.some(e=>low.includes(e))) continue;
-    const s=line.replace(/[lI](?=\d)/g," ").replace(/\//g," ").replace(/\s+/g," ").trim();
-    let m=s.match(/^(\d{2})\s+(\d{2})\s+(20\d{2})\s+(\d{2})\s+(\d{2})\s+(20\d{2})\s+(.+)$/);
-    if(!m){const m2=s.match(/^(\d{2})\s+(\d{2})\s+(20\d{2})\s+(\d{2})\s+(\d{2})\s+(.+)$/);if(m2)m=[m2[0],m2[1],m2[2],m2[3],m2[4],m2[5],m2[3],m2[6]];}
-    if(!m) continue;
-    const[,d1,mo1,y1,,,,rest]=m;
-    const ams=[...rest.matchAll(AMOUNT_RE)];
-    if(!ams.length) continue;
-    const amount=cleanAmount(ams[ams.length-1][0]);
-    if(!amount) continue;
-    const nature=cleanNature(rest.replace(AMOUNT_RE,"").replace(/\s+/g," ").trim());
-    const cr=looksCredit(nature);
-    txs.push({ligne:txs.length+1,date_operation:`${d1}/${mo1}/${y1}`,date_valeur:`${d1}/${mo1}/${y1}`,reference:"",libelle:nature||"Transaction",montant_debit:cr?null:amount,montant_credit:cr?amount:null});
-  }
-  return txs;
-}
- 
-// Parser CIH: DD/MM/YYYY LIBELLE MONTANT
-function parserCIH(lines:string[], year:number): any[] {
-  const txs:any[]=[];
-  for(const line of lines) {
-    const low=line.toLowerCase();
-    if(EXCL_PARSER.some(e=>low.includes(e))) continue;
-    const ams=[...line.matchAll(AMOUNT_RE)];
-    if(!ams.length) continue;
-    const amount=cleanAmount(ams[ams.length-1][0]);
-    if(!amount) continue;
-    let m=line.match(/^(\d{2})\/(\d{2})\/(\d{4})\s+(.+?)\s+[\d\s]+,\d{2}\s*$/);
-    if(m){
-      const[,d,mo,y,nat]=m;
-      const nature=cleanNature(nat);
-      const cr=looksCredit(nature);
-      txs.push({ligne:txs.length+1,date_operation:`${d}/${mo}/${y}`,date_valeur:`${d}/${mo}/${y}`,reference:"",libelle:nature||"Transaction",montant_debit:cr?null:amount,montant_credit:cr?amount:null});
-      continue;
-    }
-    m=line.match(/^(\d{2})\/(\d{2})\s+(.+?)\s+[\d\s]+,\d{2}\s*$/);
-    if(m){
-      const[,d,mo,nat]=m;
-      if(parseInt(d)>31||parseInt(mo)>12) continue;
-      const nature=cleanNature(nat);
-      const cr=looksCredit(nature);
-      txs.push({ligne:txs.length+1,date_operation:`${d}/${mo}/${year}`,date_valeur:`${d}/${mo}/${year}`,reference:"",libelle:nature||"Transaction",montant_debit:cr?null:amount,montant_credit:cr?amount:null});
-    }
-  }
-  return txs;
-}
- 
-function parserRelevePDF(text:string):{txs:any[];info:InfoReleve} {
-  const lower=text.toLowerCase();
-  const banque=lower.includes("attijariwafa")?"Attijariwafa Bank"
-    :lower.includes("banque populaire")?"Banque Populaire"
-    :lower.includes("cih")?"CIH Bank"
-    :lower.includes("bmce")||lower.includes("bank of africa")?"BMCE Bank of Africa"
-    :lower.includes("bmci")?"BMCI"
-    :lower.includes("société générale")||lower.includes("societe generale")?"Société Générale"
-    :"Banque";
- 
-  // Soldes — pattern robuste (saute la date DD MM YYYY avant le montant)
-  const mInit=text.match(/SOLDE\s+DEPART\s+AU\s+\d{1,2}\s+\d{1,2}\s+\d{4}\s+([\d\s]+,\d{2})\s*(CREDITEUR|DEBITEUR)?/i)
-    ??text.match(/ANCIEN\s+SOLDE[^\r\n]*([\d\s]+,\d{2})/i)
-    ??text.match(/(?:SOLDE\s+DEPART|ANCIEN\s+SOLDE)[^\r\n]*([\d\s]+,\d{2})/i);
-  const mFin=text.match(/SOLDE\s+FINAL\s+AU\s+\d{1,2}\s+\d{1,2}\s+\d{4}\s+([\d\s]+,\d{2})\s*(CREDITEUR|DEBITEUR)?/i)
-    ??text.match(/SOLDE\s+A\s+REPORTER\s*:?\s*([\d\s]+,\d{2})/i)
-    ??text.match(/(?:SOLDE\s+FINAL|SOLDE\s+A\s+REPORTER|NOUVEAU\s+SOLDE)[^\r\n]*([\d\s]+,\d{2})/i);
- 
-  const parseAmt=(m:RegExpMatchArray|null):number=>{
-    if(!m) return 0;
-    const n=cleanAmount(m[1]??"")||0;
-    return (m[2]??"").toUpperCase().startsWith("DEB")?-n:n;
+  if (amount === null) return null;
+
+  const cr = looksCredit(nature);
+  return {
+    ligne: null,
+    date_operation: cleanDateParts(d1, m1, String(year)),
+    date_valeur: cleanDateParts(d2, m2, y2),
+    reference: code,
+    libelle: nature || "Transaction",
+    montant_debit: cr ? null : amount,
+    montant_credit: cr ? amount : null,
   };
- 
-  const mRib=text.match(/(\d{3})\s+(\d{3})\s+([\d\s]{8,}?)\s+(\d{2})/);
-  const rib=mRib?`${mRib[1]} ${mRib[2]} ${mRib[3].trim()} ${mRib[4]}`:"";
-  const year=new Date().getFullYear();
-  const lines=text.split(/\r?\n/).map(l=>l.trim()).filter(l=>l.length>1);
- 
-  // Détecter banque et utiliser le bon parser
-  let txs:any[]=[];
-  const isATW=lower.includes("attijariwafa")||lines.some(l=>/^[A-Z0-9]{5,7}\s+\d{2}\s+\d{2}/.test(l));
-  const isBP=lower.includes("banque populaire")||lower.includes("bmce")||lower.includes("bmci");
-  const isCIH=lower.includes("cih");
- 
-  if(isATW) {
-    txs=parserATW(lines,year);
-  } else if(isBP) {
-    txs=parserBP(lines,year);
-  } else if(isCIH) {
-    txs=parserCIH(lines,year);
-  } else {
-    // Essayer tous les parsers
-    txs=parserATW(lines,year);
-    if(txs.length<3) txs=parserBP(lines,year);
-    if(txs.length<3) txs=parserCIH(lines,year);
-  }
- 
-  console.log(`[PARSER] Banque: ${banque} | Transactions: ${txs.length} | Solde init: ${parseAmt(mInit)} | Solde final: ${parseAmt(mFin)}`);
- 
-  return{txs,info:{banque,rib,solde_initial:parseAmt(mInit),solde_final:parseAmt(mFin)}};
 }
- 
+
+// ── bp_split_line — porté EXACTEMENT de bank_statement_parser_BP_ATTIJARI_PROPRE.py ──
+function bpSplitLine(line: string): any | null {
+  const raw = norm(line);
+  let s = raw.replace(/(?<=\d)[lI](?=\d)/g," ").replace(/\//g," ");
+  s = norm(s);
+
+  let m = s.match(/^(\d{2})\s+(\d{2})\s+(20\d{2})(\d{0,3})\s+(\d{1,3})?\s*(\d{2})\s+(20\d{2})\s*(.*)$/);
+  let d1:string,m1:string,y1:string,d2:string,m2:string,y2:string,rest:string;
+
+  if (m) {
+    [,d1,m1,y1,,, m2,y2,rest] = m;
+    const d2tail = m[4] || m[5] || "";
+    d2 = d2tail.slice(-2) || d1;
+  } else {
+    const m3 = s.match(/^(\d{2})\s+(\d{2})\s+(20\d{2})\s+(\d{2})\s+(\d{2})\s+(.*)$/);
+    if (!m3) return null;
+    [,d1,m1,y1,d2,m2,rest] = m3;
+    y2 = String(parseInt(m2) > parseInt(m1) ? parseInt(y1)-1 : parseInt(y1));
+  }
+
+  const date_op  = cleanDateParts(d1,m1,y1);
+  const date_val = cleanDateParts(d2,m2,y2);
+  if (!date_op || !date_val) return null;
+
+  // Référence
+  let ref = "";
+  const restRef = rest.replace(/O/g,"0");
+  const rm = restRef.match(/^([A-Z0-9]{4,12})\s*(.*)$/i);
+  if (rm) {
+    let cand = rm[1].toUpperCase();
+    if (!["PAIEMENT","RETRAIT","COMMISSION","TAXE","FRAIS","VIR"].includes(cand)) {
+      if (cand.length > 6 && "01519".includes(cand[0])) cand = cand.slice(-6);
+      ref = cand;
+      rest = norm(rest.slice(rm[1].length));
+    }
+  }
+
+  const amounts = [...rest.matchAll(new RegExp(AMOUNT_RE_STR,"g"))].map(a => a[0]);
+  const amount = amounts.length ? cleanAmount(amounts[amounts.length-1]) : null;
+  if (amount === null) return null;
+
+  let nature = rest;
+  if (amounts.length) nature = norm(nature.replace(amounts[amounts.length-1],""));
+
+  const cr = looksCredit(nature);
+  return {
+    ligne: null,
+    date_operation: date_op,
+    date_valeur: date_val,
+    reference: ref,
+    libelle: norm(nature) || "Transaction",
+    montant_debit: cr ? null : amount,
+    montant_credit: cr ? amount : null,
+  };
+}
+
+// ── awb_soldes — porté EXACTEMENT du Python ──────────────────────────────────────
+function awbSoldes(text: string): { solde_initial: number; solde_final: number } {
+  const t = norm(text);
+  let si = 0, sf = 0;
+  const mi = t.match(/SOLDE\s+DEPART\s+AU\s+\d{1,2}\s+\d{1,2}\s+\d{4}\s+(\d{1,3}(?:[\s.]?\d{3})*[,.]\s*\d{2})\s*(CREDITEUR|DEBITEUR)?/i);
+  if (mi) { const a = cleanAmount(mi[1])??0; si = (mi[2]||"").toUpperCase().startsWith("DEB") ? -a : a; }
+  const mf = t.match(/SOLDE\s+FINAL\s+AU\s+\d{1,2}\s+\d{1,2}\s+\d{4}\s+(\d{1,3}(?:[\s.]?\d{3})*[,.]\s*\d{2})\s*(CREDITEUR|DEBITEUR)?/i);
+  if (mf) { const a = cleanAmount(mf[1])??0; sf = (mf[2]||"").toUpperCase().startsWith("DEB") ? -a : a; }
+  return { solde_initial: si, solde_final: sf };
+}
+
+// ── bp_soldes — porté EXACTEMENT du Python ───────────────────────────────────────
+function bpSoldes(text: string): { solde_initial: number; solde_final: number } {
+  const t = norm(text);
+  let si = 0, sf = 0;
+  const mi = t.match(/ANCIEN\s+SOLDE\s+AU?\s*[:.=]?\s*[\d\/\- ]*?(\d{1,3}(?:[\s.]?\d{3})*[,.]\s*\d{2}|\d+[,.]\s*\d{2})/i);
+  if (mi) si = cleanAmount(mi[1]) ?? 0;
+  const mf = t.match(/SOLDE\s+A\s+REPORTER\s*[:.=]?\s*(\d{1,3}(?:[\s.]?\d{3})*[,.]\s*\d{2}|\d+[,.]\s*\d{2})/i);
+  if (mf) sf = cleanAmount(mf[1]) ?? 0;
+  return { solde_initial: si, solde_final: sf };
+}
+
+// ── PRÉPROCESSEUR : reconstruit les lignes ATW fragmentées par PDF.js ────────────
+// PDF.js sépare en colonnes: codes | libellés | dates | montants sur des lignes séparées
+// Ce préprocesseur les regroupe AVANT de passer à awbLineToTx
+const ATW_CODE_ONLY = /^([A-Z0-9]{5,7})\s+(\d{2})\s+(\d{2})\s*$/;
+const ATW_CODE_FULL = /^[A-Z0-9]{5,7}\s+\d{2}\s+\d{2}\s+\S/;
+const PURE_DATE_RE  = /^\d{2}\s+\d{2}\s+20\d{2}\s*$/;
+const PURE_AMT_RE   = /^\d{1,3}(?:\s\d{3})*,\d{2}\s*$/;
+
+function preprocessATW(lines: string[]): string[] {
+  const result: string[] = [];
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+
+    // Ligne complète ATW (code + libellé + date + montant) → passer directement
+    if (ATW_CODE_FULL.test(line) && new RegExp(AMOUNT_RE_STR).test(line) && /\d{2}\s+\d{2}\s+20\d{2}/.test(line)) {
+      result.push(line); i++; continue;
+    }
+
+    // Début d'un bloc de codes fragmentés (code seul sur la ligne)
+    if (ATW_CODE_ONLY.test(line)) {
+      // Collecter tous les codes fragmentés consécutifs
+      const fragCodes: [string,string,string][] = [];
+      let j = i;
+      while (j < lines.length) {
+        const mc = ATW_CODE_ONLY.exec(lines[j]);
+        if (mc) { fragCodes.push([mc[1], mc[2], mc[3]]); j++; }
+        else break;
+      }
+
+      // Collecter libellés, dates, montants des lignes suivantes
+      const libelles: string[] = [], dates: string[] = [], montants: string[] = [];
+      let k = j;
+      while (k < lines.length && !ATW_CODE_ONLY.test(lines[k]) && !ATW_CODE_FULL.test(lines[k])) {
+        const ln = lines[k].trim();
+        if (PURE_DATE_RE.test(ln))       dates.push(ln);
+        else if (PURE_AMT_RE.test(ln))   montants.push(ln);
+        else if (ln && !/^[\d\s.,:=\-\/]+$/.test(ln)) libelles.push(ln);
+        k++;
+      }
+
+      // Associer dans l'ordre: code[n] → libelle[n] + date[n] + montant[n]
+      fragCodes.forEach(([code,d1,m1], n) => {
+        const lib = libelles[n] ?? "Transaction";
+        const dat = dates[n]    ?? `${d1} ${m1} ${new Date().getFullYear()}`;
+        const amt = montants[n] ?? null;
+        if (amt) result.push(`${code} ${d1} ${m1} ${lib} ${dat} ${amt}`);
+      });
+
+      i = k; continue;
+    }
+
+    result.push(line); i++;
+  }
+  return result;
+}
+
+// ── Parser principal multi-banques ────────────────────────────────────────────────
+const EXCL_LINES = /^(?:CODE|DATE\s+OP|LIBELLE|VALEUR|NATURE|REFERENCE|MONTANT|TOTAL\s+MOUVEMENTS|SOLDE\s+(?:DEPART|FINAL|A\s+REPORTER)|ANCIEN\s+SOLDE|NOUVEAU\s+SOLDE|ATTIJARIWAFA\s+BANK|BANQUE\s+POPULAIRE\s+DU|CIH\s+BANK\s+SA|AGENCE\s*:|PAGE\s+\d|RELEVE\s+D.IDENTITE|EXTRAIT\s+DE\s+COMPTE|NOUS\s+AVONS)/i;
+
+function parserRelevePDF(text: string): { txs: any[]; info: InfoReleve } {
+  const lower = text.toLowerCase();
+  const banque = lower.includes("attijariwafa") ? "Attijariwafa Bank"
+    : lower.includes("banque populaire") ? "Banque Populaire"
+    : lower.includes("cih") ? "CIH Bank"
+    : lower.includes("bmce")||lower.includes("bank of africa") ? "BMCE Bank of Africa"
+    : lower.includes("bmci") ? "BMCI"
+    : lower.includes("société générale")||lower.includes("societe generale") ? "Société Générale"
+    : "Banque";
+
+  const isATW = lower.includes("attijariwafa") || /^[A-Z0-9]{5,7}\s+\d{2}\s+\d{2}/m.test(text);
+  const isCIH = lower.includes("cih bank") || lower.includes("cih ");
+
+  console.log(`[PARSER] Banque: ${banque} | isATW: ${isATW} | isCIH: ${isCIH} | lignes total: ${text.split(/\r?\n/).length}`);
+
+  // Soldes
+  const soldes = isATW ? awbSoldes(text) : bpSoldes(text);
+
+  // RIB
+  const mRib = text.match(/(\d{3})\s+(\d{3})\s+([\d\s]{8,}?)\s+(\d{2})\b/);
+  const rib = mRib ? `${mRib[1]} ${mRib[2]} ${mRib[3].trim()} ${mRib[4]}` : "";
+
+  const year = new Date().getFullYear();
+  const rawLines = text.split(/\r?\n/).map(l => norm(l)).filter(l => l.length > 1 && !EXCL_LINES.test(l));
+
+  let txs: any[] = [];
+  let ligneNum = 1;
+
+  if (isATW) {
+    // Préprocesseur: reconstruire lignes fragmentées, PUIS awbLineToTx
+    const processedLines = preprocessATW(rawLines);
+    for (const line of processedLines) {
+      const tx = awbLineToTx(line, year);
+      if (tx) { tx.ligne = ligneNum++; txs.push(tx); }
+    }
+  } else if (isCIH) {
+    // CIH: DD/MM/YYYY [REF] LIBELLE MONTANT
+    for (const line of rawLines) {
+      const amounts = [...line.matchAll(new RegExp(AMOUNT_RE_STR,"g"))].map(a=>a[0]);
+      if (!amounts.length) continue;
+      const amount = cleanAmount(amounts[amounts.length-1]);
+      if (!amount) continue;
+      const m1 = line.match(/^(\d{2})\/(\d{2})\/(\d{4})\s+(.+?)\s+[\d\s]+,\d{2}\s*$/);
+      if (m1) {
+        const [,d,mo,y,nat] = m1;
+        const nature = cleanNatureText(nat); const cr = looksCredit(nature);
+        txs.push({ ligne:ligneNum++, date_operation:`${d}/${mo}/${y}`, date_valeur:`${d}/${mo}/${y}`, reference:"", libelle:nature||"Transaction", montant_debit:cr?null:amount, montant_credit:cr?amount:null });
+        continue;
+      }
+      const m2 = line.match(/^(\d{2})\/(\d{2})\s+(.+?)\s+[\d\s]+,\d{2}\s*$/);
+      if (m2) {
+        const [,d,mo,nat] = m2;
+        if (parseInt(d)>31||parseInt(mo)>12) continue;
+        const nature = cleanNatureText(nat); const cr = looksCredit(nature);
+        txs.push({ ligne:ligneNum++, date_operation:`${d}/${mo}/${year}`, date_valeur:`${d}/${mo}/${year}`, reference:"", libelle:nature||"Transaction", montant_debit:cr?null:amount, montant_credit:cr?amount:null });
+      }
+    }
+  } else {
+    // BP/BMCE/BMCI: bp_split_line avec accumulation (bp_extract_transactions Python)
+    let current: any = null;
+    const flush = () => {
+      if (current && (current.montant_debit != null || current.montant_credit != null)) {
+        current.ligne = ligneNum++; txs.push(current);
+      }
+      current = null;
+    };
+    const allLines = text.split(/\r?\n/).map(l => norm(l)).filter(l => l.length > 1);
+    for (const line of allLines) {
+      // Filtrer en-têtes mais PAS les lignes de transactions
+      if (/^(?:DATE|LIBELLE|NATURE|REFERENCE|MONTANT|TOTAL\s+MOUVEMENTS|ANCIEN\s+SOLDE|SOLDE\s+A\s+REPORTER|RELEVE\s+D|EXTRAIT\s+DE|NOUS\s+AVONS)/i.test(line)) {
+        flush(); continue;
+      }
+      if (/^(?:SOLDE\s+(?:DEPART|FINAL)|ANCIEN\s+SOLDE)/i.test(line)) { flush(); continue; }
+      const tx = bpSplitLine(line);
+      if (tx) { flush(); current = tx; continue; }
+      if (current) {
+        const amounts = [...line.matchAll(new RegExp(AMOUNT_RE_STR,"g"))].map(a => a[0]);
+        if (current.montant_debit == null && current.montant_credit == null && amounts.length) {
+          const amt = cleanAmount(amounts[amounts.length-1]);
+          if (looksCredit(current.libelle)) current.montant_credit = amt;
+          else current.montant_debit = amt;
+        }
+        let cl = line;
+        for (const a of amounts) cl = cl.replace(a,"");
+        cl = norm(cl);
+        if (cl && !/^[\d\s.,:=\-\/]+$/.test(cl)) current.libelle = (current.libelle + " " + cl).trim();
+      }
+    }
+    flush();
+  }
+
+  console.log(`[PARSER] ${banque} | ${txs.length} transactions | SI:${soldes.solde_initial} | SF:${soldes.solde_final}`);
+  return { txs, info: { banque, rib, solde_initial: soldes.solde_initial, solde_final: soldes.solde_final } };
+}
+
 // PCM mapping pour catégories
 const PCM_MAP:Record<string,{code:string;tva:number}>={
   encaissement_client:{code:"3421",tva:0},
@@ -408,7 +391,7 @@ const PCM_MAP:Record<string,{code:string;tva:number}>={
   transport:{code:"6145",tva:0},
   autre:{code:"6141",tva:0},
 };
- 
+
 const CATEGORIES=[
   {value:"encaissement_client",label:"Encaissement client"},
   {value:"paiement_fournisseur",label:"Paiement fournisseur"},
@@ -429,12 +412,12 @@ const CATEGORIES=[
   {value:"transport",label:"Transport / Déplacement"},
   {value:"autre",label:"Autre"},
 ];
- 
+
 // ─── Composant ────────────────────────────────────────────────────────────────
 function BanquePage() {
   const { dossierId } = Route.useParams();
   const analyserFn = useServerFn(analyserReleveIA);
- 
+
   const [tab, setTab] = useState<"comptes"|"releves"|"scanner"|"encaissements">("comptes");
   const [comptes, setComptes] = useState<Compte[]>([]);
   const [selectedId, setSelectedId] = useState<string|null>(null);
@@ -446,7 +429,7 @@ function BanquePage() {
   const [clients, setClients] = useState<any[]>([]);
   const [fournisseurs, setFournisseurs] = useState<any[]>([]);
   const [dossier, setDossier] = useState<any>(null);
- 
+
   // Scanner état
   const [scanLoading, setScanLoading] = useState(false);
   const [scanStep, setScanStep] = useState<"idle"|"review"|"done">("idle");
@@ -458,13 +441,13 @@ function BanquePage() {
   const [showRemarques, setShowRemarques] = useState(false);
   const [saving, setSaving] = useState(false);
   const [selectedTx, setSelectedTx] = useState<number|null>(null);
- 
+
   // Autres modals
   const [openCompte, setOpenCompte] = useState(false);
   const [openEncaissement, setOpenEncaissement] = useState(false);
   const [processing, setProcessing] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
- 
+
   const [formCompte, setFormCompte] = useState({banque:"",intitule:"",rib:"",iban:"",solde_actuel:0});
   const [formEnc, setFormEnc] = useState({
     type:"especes" as "especes"|"cheque", montant:0,
@@ -472,7 +455,7 @@ function BanquePage() {
     reference:"",numero_cheque:"",banque_cheque:"",libelle:"",
     facture_id:"",facture_fournisseur_id:"",
   });
- 
+
   const load = async () => {
     const [{data:c},{data:r},{data:fc},{data:ff},{data:fo},{data:cl},{data:dos}]=await Promise.all([
       supabase.from("comptes_bancaires").select("*").eq("dossier_id",dossierId).order("created_at"),
@@ -481,7 +464,7 @@ function BanquePage() {
       (supabase as any).from("factures_fournisseurs").select("id,numero,montant_ttc,montant_ht,montant_tva,date_facture,date_echeance,fournisseur_nom").eq("dossier_id",dossierId).neq("statut_paiement","payee"),
       (supabase as any).from("fournisseurs").select("id,nom,ice").eq("dossier_id",dossierId),
       supabase.from("clients").select("id,nom,ice").eq("dossier_id",dossierId),
-      supabase.from("dossiers" as any).select("nom_societe,ice").eq("id",dossierId).single(),
+      (supabase.from("dossiers") as any).select("nom_societe,ice,if_fiscal").eq("id",dossierId).single(),
     ]);
     setComptes((c??[]) as Compte[]);
     setReleves((r??[]) as Releve[]);
@@ -495,17 +478,17 @@ function BanquePage() {
       ...((ff??[]) as any[]).map((f:any)=>({id:f.id,type:"fournisseur" as const,numero:f.numero,nom:f.fournisseur_nom??"Fournisseur",montant_ttc:Number(f.montant_ttc),date_echeance:f.date_echeance})),
     ]);
   };
- 
+
   const loadTx=async(cid:string)=>{
     const{data}=await supabase.from("transactions_bancaires").select("*").eq("compte_id",cid).order("date_operation",{ascending:false}).limit(100);
     setTransactions((data??[]) as TxBancaire[]);
   };
- 
+
   useEffect(()=>{load();},[dossierId]);
   useEffect(()=>{if(selectedId)loadTx(selectedId);},[selectedId]);
- 
+
   const selected=comptes.find(c=>c.id===selectedId);
- 
+
   // ── SCANNER RELEVÉ ────────────────────────────────────────────────────────
   const handleReleveUpload=async(file:File)=>{
     if(!releveCompteId){toast.error("Sélectionnez d'abord un compte bancaire");return;}
@@ -531,18 +514,18 @@ function BanquePage() {
         }
         if(lineText.trim()) fullText+=lineText.trimEnd()+"\n";
       }
- 
+
       // Parser multi-banques
       const{txs:txBrutes,info}=parserRelevePDF(fullText);
       setInfoReleve(info);
- 
+
       if(txBrutes.length===0){
         toast.error("Aucune transaction détectée. Ce PDF est peut-être une image non OCRisée.");
         setScanLoading(false);return;
       }
- 
+
       toast.info(`${txBrutes.length} transactions extraites — analyse IA en cours…`);
- 
+
       // Analyse IA: catégorisation + matching
       const result=await analyserFn({
         data:{
@@ -554,7 +537,7 @@ function BanquePage() {
           remarques,
         },
       });
- 
+
       // Fusionner parser + IA
       const txFinal:TxExtracted[]=txBrutes.map((tx:any,idx:number)=>{
         const a=result.analyses.find((x:any)=>x.i===idx)??result.analyses[idx]??{};
@@ -576,9 +559,11 @@ function BanquePage() {
           confiance:a.confiance??50,
           facture_id:a.facture_id??null,
           alerte:a.alerte??null,
+          tiers_nom:a.tiers_nom??null,
+          etape_rapprochement:a.etape_rapprochement??"direction",
         };
       });
- 
+
       setTxExtraites(txFinal);
       setScanStep("review");
       const nbMatch=txFinal.filter(t=>t.facture_id).length;
@@ -586,8 +571,8 @@ function BanquePage() {
     }catch(e:any){toast.error("Erreur: "+e.message);}
     finally{setScanLoading(false);}
   };
- 
-  const updateTxExtrait=(idx:number,updates:Partial<TxExtracted>)=>{
+
+  const updateTxExtrait=(idx:number,updates:Partial<TxExtracted & {facture_id_manuel?: string}>)=>{
     setTxExtraites(prev=>prev.map((tx,i)=>{
       if(i!==idx) return tx;
       const updated={...tx,...updates};
@@ -595,85 +580,238 @@ function BanquePage() {
         const pcm=PCM_MAP[updates.categorie]??{code:"6141",tva:0};
         updated.compte_comptable=pcm.code;
       }
+      // Si on choisit manuellement une facture
+      if(updates.facture_id !== undefined){
+        const fClient=facturesClient.find((f:any)=>f.id===updates.facture_id);
+        const fFourn=facturesFourn.find((f:any)=>f.id===updates.facture_id);
+        if(fClient){ updated.reference_facture=fClient.numero; updated.categorie="encaissement_client"; updated.compte_comptable="3421"; }
+        if(fFourn){ updated.reference_facture=fFourn.numero; updated.categorie="paiement_fournisseur"; updated.compte_comptable="4411"; }
+      }
       return updated;
     }));
   };
- 
+
   const handleValiderReleve=async()=>{
     if(!txExtraites.length||!releveCompteId) return;
     setSaving(true);
     try{
       const compte=comptes.find(c=>c.id===releveCompteId);
       let soldeCourant=compte?.solde_actuel??0;
- 
+
       const txToInsert=txExtraites.map(tx=>({
         compte_id:releveCompteId,dossier_id:dossierId,
         date_operation:tx.date_operation,libelle:tx.libelle,
         type:tx.type,montant:tx.montant,
         solde_apres:0,rapproche:!!tx.facture_id,
       }));
- 
+
       for(const tx of txToInsert){
         soldeCourant=Math.round((soldeCourant+(tx.type==="credit"?tx.montant:-tx.montant))*100)/100;
         tx.solde_apres=soldeCourant;
       }
- 
+
       await supabase.from("transactions_bancaires").insert(txToInsert);
-      await supabase.from("comptes_bancaires").update({solde_actuel:soldeCourant}).eq("id",releveCompteId);
- 
-      // Écritures comptables PCM
+      await (supabase.from("comptes_bancaires") as any).update({solde_actuel:soldeCourant}).eq("id",releveCompteId);
+
+      // ── Écritures comptables PCM correctes ────────────────────────────────
+      // RÈGLE: CRÉDIT bancaire (argent reçu) → 5141 DÉBIT / contre-compte CRÉDIT
+      //        DÉBIT bancaire (argent sorti)  → 5141 CRÉDIT / contre-compte DÉBIT
       const ecritures:any[]=[];
       const fcPay:string[]=[],ffPay:string[]=[];
- 
+
       for(const tx of txExtraites){
         const parts=tx.date_operation.split("/");
         const date=parts.length===3&&parts[2].length===4?`${parts[2]}-${parts[1]}-${parts[0]}`:tx.date_operation;
         const libelle=tx.libelle.slice(0,100);
         const pcm=PCM_MAP[tx.categorie]??{code:"6141",tva:0};
-        const ht=pcm.tva>0?Math.round(tx.montant/(1+pcm.tva/100)*100)/100:tx.montant;
-        const tva=pcm.tva>0?Math.round((tx.montant-ht)*100)/100:0;
- 
-        // Écriture banque 5141
-        ecritures.push({dossier_id:dossierId,journal_code:"BQ",compte_numero:"5141",date_ecriture:date,libelle,debit:tx.type==="credit"?tx.montant:0,credit:tx.type==="debit"?tx.montant:0,reference_piece:tx.reference_facture||tx.reference,valide:true});
- 
-        // Contre-écriture PCM
-        if(tva>0&&tx.type==="debit"){
-          ecritures.push({dossier_id:dossierId,journal_code:"BQ",compte_numero:tx.compte_comptable,date_ecriture:date,libelle,debit:ht,credit:0,reference_piece:tx.reference_facture,valide:true});
-          ecritures.push({dossier_id:dossierId,journal_code:"BQ",compte_numero:"34552",date_ecriture:date,libelle:`TVA ${libelle.slice(0,50)}`,debit:tva,credit:0,reference_piece:tx.reference_facture,valide:true});
-        }else{
-          ecritures.push({dossier_id:dossierId,journal_code:"BQ",compte_numero:tx.compte_comptable,date_ecriture:date,libelle,debit:tx.type==="debit"?0:ht,credit:tx.type==="credit"?0:ht,reference_piece:tx.reference_facture,valide:true});
+        const isCr=tx.type==="credit"; // argent reçu = crédit bancaire
+        const montant=tx.montant;
+
+        // TVA récupérable uniquement sur les DÉBITS (achats) avec TVA > 0
+        // Pas de TVA sur les encaissements clients (c'est la facture qui porte la TVA)
+        const applyTva = !isCr && pcm.tva>0 && tx.categorie!=="encaissement_client";
+        const ht  = applyTva ? Math.round(montant/(1+pcm.tva/100)*100)/100 : montant;
+        const tva = applyTva ? Math.round((montant-ht)*100)/100 : 0;
+
+        // Écriture 1: compte banque 5141
+        // Crédit bancaire (reçu) → 5141 DÉBIT
+        // Débit bancaire (sorti) → 5141 CRÉDIT
+        ecritures.push({
+          dossier_id:dossierId,journal_code:"BQ",compte_numero:"5141",
+          date_ecriture:date,libelle,
+          debit:isCr?montant:0,
+          credit:isCr?0:montant,
+          reference_piece:tx.reference_facture||tx.reference,valide:true,
+        });
+
+        // Écriture 2: contre-compte PCM
+        if(applyTva){
+          // Charge HT
+          ecritures.push({
+            dossier_id:dossierId,journal_code:"BQ",compte_numero:pcm.code,
+            date_ecriture:date,libelle,
+            debit:ht,credit:0,  // charge = débit
+            reference_piece:tx.reference_facture,valide:true,
+          });
+          // TVA déductible 34552
+          ecritures.push({
+            dossier_id:dossierId,journal_code:"BQ",compte_numero:"34552",
+            date_ecriture:date,libelle:`TVA ${libelle.slice(0,50)}`,
+            debit:tva,credit:0,
+            reference_piece:tx.reference_facture,valide:true,
+          });
+        } else if(isCr && tx.categorie==="encaissement_client"){
+          // Encaissement client: 3421 CRÉDIT (client solde sa dette)
+          ecritures.push({
+            dossier_id:dossierId,journal_code:"BQ",compte_numero:"3421",
+            date_ecriture:date,libelle,
+            debit:0,credit:montant,
+            reference_piece:tx.reference_facture,valide:true,
+          });
+        } else if(!isCr && tx.categorie==="paiement_fournisseur"){
+          // Paiement fournisseur: 4411 DÉBIT (on solde notre dette)
+          ecritures.push({
+            dossier_id:dossierId,journal_code:"BQ",compte_numero:"4411",
+            date_ecriture:date,libelle,
+            debit:montant,credit:0,
+            reference_piece:tx.reference_facture,valide:true,
+          });
+        } else if(!isCr && tx.categorie==="retrait_especes"){
+          // Retrait: 5141 CRÉDIT (déjà fait) + 5161 DÉBIT (caisse augmente)
+          ecritures.push({
+            dossier_id:dossierId,journal_code:"BQ",compte_numero:"5161",
+            date_ecriture:date,libelle,
+            debit:montant,credit:0,
+            reference_piece:tx.reference,valide:true,
+          });
+        } else if(!isCr){
+          // Autres charges sans TVA: compte charge DÉBIT
+          ecritures.push({
+            dossier_id:dossierId,journal_code:"BQ",compte_numero:pcm.code,
+            date_ecriture:date,libelle,
+            debit:montant,credit:0,
+            reference_piece:tx.reference_facture,valide:true,
+          });
+        } else {
+          // Autres crédits (intérêts, etc.): contre-compte CRÉDIT
+          ecritures.push({
+            dossier_id:dossierId,journal_code:"BQ",compte_numero:pcm.code,
+            date_ecriture:date,libelle,
+            debit:0,credit:montant,
+            reference_piece:tx.reference_facture,valide:true,
+          });
         }
- 
-        // Marquer factures matchées
+
+        // Rapprochement factures
         if(tx.facture_id){
-          const fc=facturesClient.find((f:any)=>f.id===tx.facture_id);
-          const ff=facturesFourn.find((f:any)=>f.id===tx.facture_id);
-          if(fc) fcPay.push(tx.facture_id);
-          else if(ff) ffPay.push(tx.facture_id);
+          const isClientFac=facturesClient.some((f:any)=>f.id===tx.facture_id);
+          const isFournFac=facturesFourn.some((f:any)=>f.id===tx.facture_id);
+          if(isClientFac&&isCr) fcPay.push(tx.facture_id);
+          else if(isFournFac&&!isCr) ffPay.push(tx.facture_id);
         }
       }
- 
+
       await supabase.from("ecritures_comptables").insert(ecritures);
       if(fcPay.length>0) await (supabase.from("factures") as any).update({statut_paiement:"payee",date_paiement:new Date().toISOString().slice(0,10)}).in("id",fcPay);
-      if(ffPay.length>0) await (supabase as any).from("factures_fournisseurs").update({statut_paiement:"payee",date_paiement:new Date().toISOString().slice(0,10)}).in("id",ffPay);
- 
-      await (supabase as any).from("releves_bancaires").insert({
+      if(ffPay.length>0) await ((supabase.from("factures_fournisseurs") as any) as any).update({statut_paiement:"payee",date_paiement:new Date().toISOString().slice(0,10)}).in("id",ffPay);
+
+      await (((supabase.from("releves_bancaires") as any) as any) as any).insert({
         compte_id:releveCompteId,dossier_id:dossierId,
         nombre_transactions:txExtraites.length,
         solde_initial:compte?.solde_actuel??0,
         solde_final:soldeCourant,statut:"valide",
         fichier_nom:"relevé importé",
       });
- 
+
       const nbPay=fcPay.length+ffPay.length;
-      toast.success(`${txExtraites.length} transactions enregistrées + écritures PCM créées`+(nbPay>0?` — ${nbPay} facture(s) payée(s)`:""));
+      toast.success(`${txExtraites.length} transactions enregistrées + écritures PCM correctes`+(nbPay>0?` — ${nbPay} facture(s) payée(s)`:""));
       setScanStep("done");
       load();
       if(selectedId) loadTx(selectedId);
     }catch(e:any){toast.error(e.message);}
     finally{setSaving(false);}
   };
- 
+
+    // ── Génération EDI DGI — format Relevé de Déduction (ADC082F-15I) ──────────────
+  const genererEDI=()=>{
+    // Filtrer uniquement les paiements fournisseurs avec TVA (achats déductibles)
+    const txEligibles=txExtraites.filter(tx=>
+      tx.type==="debit" &&
+      (tx.categorie==="paiement_fournisseur" || PCM_MAP[tx.categorie]?.tva > 0) &&
+      PCM_MAP[tx.categorie]?.tva > 0
+    );
+    if(!txEligibles.length){ toast.warning("Aucune transaction éligible à la déduction TVA"); return; }
+
+    // Format date Excel (jours depuis 01/01/1900)
+    const toExcelDate=(dateStr:string):number=>{
+      const parts=dateStr.split("/");
+      if(parts.length!==3) return 0;
+      const d=new Date(`${parts[2]}-${parts[1]}-${parts[0]}`);
+      const start=new Date("1899-12-30");
+      return Math.round((d.getTime()-start.getTime())/(86400000));
+    };
+
+    // En-tête du fichier EDI DGI (format ADC082F-15I)
+    const dossierInfo=dossier??{nom_societe:"",ice:""};
+    const annee=new Date().getFullYear();
+    const mois=new Date().getMonth()+1;
+
+    // Lignes de données — format exact du template DGI
+    const rows:string[]=[];
+    // En-têtes obligatoires
+    rows.push(`RAISON SOCIAL\t\t${dossierInfo.nom_societe??""}`);
+    rows.push(`ID_FISCAL\t\t${dossierInfo.if_fiscal??""}`);
+    rows.push(`ANNEE\t\t${annee}`);
+    rows.push(`PERIODE(Mois)\t\t${mois}\t\t\tRelevé de déduction`);
+    rows.push(`REGIME(Encais-1)\t\t1`);
+    rows.push(``);
+    rows.push(`OR\tFACT_NUM\tDESIGNATION\tM_HT\tTVA\tM_TTC\tIF\tLIB_FRSS\tICE_FRS\tTAUX\tID_PAIE\tDATE_PAIE\tDATE_FAC`);
+
+    let totalHT=0, totalTVA=0, totalTTC=0;
+
+    txEligibles.forEach((tx,i)=>{
+      const pcm=PCM_MAP[tx.categorie]??{code:"6141",tva:20};
+      const ht=Math.round(tx.montant/(1+pcm.tva/100)*100)/100;
+      const tva=Math.round((tx.montant-ht)*100)/100;
+      // Trouver le fournisseur correspondant
+      const fournisseur=tx.tiers_nom
+        ?(fournisseurs as any[]).find(f=>f.nom?.toUpperCase().includes(tx.tiers_nom!.toUpperCase().slice(0,5)))
+        :null;
+      const dateExcel=toExcelDate(tx.date_operation);
+      // Chercher date facture dans la facture correspondante
+      const facFourn=tx.facture_id?(facturesFourn as any[]).find(f=>f.id===tx.facture_id):null;
+      const dateFacExcel=facFourn?toExcelDate(facFourn.date_facture?.split("-").reverse().join("/")||tx.date_operation):dateExcel;
+
+      totalHT+=ht; totalTVA+=tva; totalTTC+=tx.montant;
+
+      rows.push([
+        String(i+1),
+        tx.reference_facture||`TX-${i+1}`,
+        tx.libelle.slice(0,50),
+        String(Math.round(ht*100)/100),
+        String(Math.round(tva*100)/100),
+        String(tx.montant),
+        fournisseur?.if_fiscal||"",
+        tx.tiers_nom||fournisseur?.nom||"FOURNISSEUR",
+        fournisseur?.ice||"",
+        String(pcm.tva),
+        String(i+1),
+        String(dateExcel),
+        String(dateFacExcel),
+      ].join("\t"));
+    });
+
+    rows.push(`Total\t\t\t${Math.round(totalHT*100)/100}\t${Math.round(totalTVA*100)/100}\t${Math.round(totalTTC*100)/100}`);
+
+    const content2=rows.join("\n");
+    const blob=new Blob(["\uFEFF"+content2],{type:"text/tab-separated-values;charset=utf-8;"});
+    const a=document.createElement("a");
+    a.href=URL.createObjectURL(blob);
+    a.download=`EDI_DGI_${dossierInfo.nom_societe?.replace(/\s/g,"_")||"export"}_${annee}_${String(mois).padStart(2,"0")}.txt`;
+    a.click();
+    toast.success(`EDI DGI généré — ${txEligibles.length} lignes déductibles`);
+  };
+
   const genererBilan=()=>{
     const rows=[["Date","Journal","Compte","Libellé","Débit","Crédit","Catégorie","Réf."]];
     for(const tx of txExtraites){
@@ -686,9 +824,9 @@ function BanquePage() {
     const a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download=`Bilan_BQ_${new Date().toISOString().slice(0,10)}.csv`;a.click();
     toast.success("Bilan Sage généré");
   };
- 
+
   const resetScan=()=>{setScanStep("idle");setTxExtraites([]);setInfoReleve(null);setPdfUrl(null);setSelectedTx(null);};
- 
+
   // ── Encaissement (code original préservé) ─────────────────────────────────
   const handleEncaissement=async()=>{
     if(!formEnc.montant||!formEnc.date_encaissement) return toast.error("Montant et date requis");
@@ -718,13 +856,13 @@ function BanquePage() {
     }catch(e:any){toast.error(e.message);}
     finally{setProcessing(false);}
   };
- 
+
   const confColor=(c:number)=>c>=90?"text-green-600":c>=70?"text-yellow-500":"text-red-500";
   const getCatLabel=(v:string)=>CATEGORIES.find(c=>c.value===v)?.label??v;
   const totalCr=txExtraites.reduce((s,t)=>s+(t.type==="credit"?t.montant:0),0);
   const totalDb=txExtraites.reduce((s,t)=>s+(t.type==="debit"?t.montant:0),0);
   const nbMatch=txExtraites.filter(t=>t.facture_id).length;
- 
+
   return (
     <div className="p-8 max-w-7xl mx-auto">
       <div className="flex items-center justify-between mb-6">
@@ -741,7 +879,7 @@ function BanquePage() {
           </Button>
         </div>
       </div>
- 
+
       <Tabs value={tab} onValueChange={v=>setTab(v as any)}>
         <TabsList>
           <TabsTrigger value="comptes">Comptes ({comptes.length})</TabsTrigger>
@@ -752,7 +890,7 @@ function BanquePage() {
           </TabsTrigger>
           <TabsTrigger value="encaissements">Encaissements espèces/chèques</TabsTrigger>
         </TabsList>
- 
+
         {/* ── COMPTES ── */}
         <TabsContent value="comptes" className="mt-4">
           <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
@@ -819,7 +957,7 @@ function BanquePage() {
             </>
           )}
         </TabsContent>
- 
+
         {/* ── RELEVÉS ── */}
         <TabsContent value="releves" className="mt-4">
           <Card><CardContent className="p-0">
@@ -844,7 +982,7 @@ function BanquePage() {
             </Table>
           </CardContent></Card>
         </TabsContent>
- 
+
         {/* ── SCANNER ── */}
         <TabsContent value="scanner" className="mt-4">
           {scanStep==="idle"&&(
@@ -867,7 +1005,7 @@ function BanquePage() {
                   </CardContent>
                 </Card>
               )}
- 
+
               <div className="space-y-2">
                 <Label>Compte bancaire *</Label>
                 <Select value={releveCompteId} onValueChange={setReleveCompteId}>
@@ -875,7 +1013,7 @@ function BanquePage() {
                   <SelectContent>{comptes.map(c=><SelectItem key={c.id} value={c.id}>{c.intitule} — {c.banque}</SelectItem>)}</SelectContent>
                 </Select>
               </div>
- 
+
               <div className="border-2 border-dashed rounded-xl p-12 text-center cursor-pointer hover:border-primary transition-colors max-w-2xl"
                 onClick={()=>fileRef.current?.click()}
                 onDragOver={e=>e.preventDefault()}
@@ -889,7 +1027,7 @@ function BanquePage() {
               </div>
             </div>
           )}
- 
+
           {scanStep==="review"&&(
             <div className="space-y-4">
               {/* Header stats */}
@@ -903,7 +1041,8 @@ function BanquePage() {
                 </div>
                 <div className="flex gap-2">
                   <Button variant="outline" size="sm" onClick={()=>setShowRemarques(true)}><RefreshCw className="h-3.5 w-3.5 mr-1.5"/>Rescanner</Button>
-                  <Button variant="outline" size="sm" onClick={genererBilan}><Download className="h-3.5 w-3.5 mr-1.5"/>Bilan Sage</Button>
+                  <Button variant="outline" size="sm" onClick={genererEDI}><Download className="h-3.5 w-3.5 mr-1.5"/>EDI DGI</Button>
+              <Button variant="outline" size="sm" onClick={genererBilan}><Download className="h-3.5 w-3.5 mr-1.5"/>Bilan Sage</Button>
                   <Button size="sm" onClick={handleValiderReleve} disabled={saving}>
                     {saving?<Loader2 className="h-3.5 w-3.5 mr-1.5 animate-spin"/>:<CheckCircle className="h-3.5 w-3.5 mr-1.5"/>}
                     Valider et enregistrer
@@ -911,7 +1050,7 @@ function BanquePage() {
                   <Button variant="ghost" size="sm" onClick={resetScan}><X className="h-3.5 w-3.5"/></Button>
                 </div>
               </div>
- 
+
               {/* Soldes */}
               {infoReleve&&(
                 <div className="grid grid-cols-4 gap-3">
@@ -930,7 +1069,7 @@ function BanquePage() {
                   ))}
                 </div>
               )}
- 
+
               {/* Tableau transactions */}
               <Card><CardContent className="p-0">
                 <div className="max-h-[500px] overflow-y-auto">
@@ -940,22 +1079,35 @@ function BanquePage() {
                         <TableHead className="w-8">#</TableHead>
                         <TableHead>Date</TableHead>
                         <TableHead>Libellé</TableHead>
-                        <TableHead>Catégorie</TableHead>
-                        <TableHead>Code PCM</TableHead>
+                        <TableHead>Catégorie / Code PCM</TableHead>
                         <TableHead className="text-right">Montant</TableHead>
-                        <TableHead>Match</TableHead>
+                        <TableHead>Facture correspondante</TableHead>
+                        <TableHead className="w-8"></TableHead>
                       </TableRow>
                     </TableHeader>
                     <TableBody>
-                      {txExtraites.map((tx,idx)=>(
+                      {txExtraites.map((tx,idx)=>{
+                        const fClientOptions=facturesClient.map((f:any)=>({id:f.id,label:`${f.numero??f.id.slice(0,8)} — ${f.clients?.nom??""} — ${fmt(Number(f.montant_ttc))}`}));
+                        const fFournOptions=facturesFourn.map((f:any)=>({id:f.id,label:`${f.numero??f.id.slice(0,8)} — ${f.fournisseur_nom??""} — ${fmt(Number(f.montant_ttc))}`}));
+                        const facOptions=tx.type==="credit"?fClientOptions:fFournOptions;
+                        const facChoisie=tx.type==="credit"
+                          ?facturesClient.find((f:any)=>f.id===tx.facture_id)
+                          :facturesFourn.find((f:any)=>f.id===tx.facture_id);
+                        const etapeLabel:Record<string,string>={
+                          remarques:"📋 Remarques",numero_facture:"🔢 N° facture",
+                          nom_tiers:"👤 Nom tiers",montant_date:"💰 Montant",
+                          mots_cles:"🔑 Mots-clés",direction:"↕️ Direction",inconnu:"❓ Inconnu"
+                        };
+                        return(
                         <>
                           <TableRow key={idx}
-                            className={`cursor-pointer ${selectedTx===idx?"bg-primary/5":""} ${tx.facture_id?"border-l-2 border-l-green-500":""} ${tx.alerte?"border-l-2 border-l-orange-400":""}`}
+                            className={`cursor-pointer ${selectedTx===idx?"bg-primary/5":""} ${tx.facture_id?"border-l-2 border-l-green-500":tx.alerte?"border-l-2 border-l-orange-400":""}`}
                             onClick={()=>setSelectedTx(selectedTx===idx?null:idx)}>
                             <TableCell className="text-xs text-muted-foreground">{idx+1}</TableCell>
                             <TableCell className="text-xs font-mono">{tx.date_operation}</TableCell>
-                            <TableCell className="text-sm max-w-[200px]">
-                              <p className="truncate">{tx.libelle}</p>
+                            <TableCell className="text-sm max-w-[180px]">
+                              <p className="truncate font-medium">{tx.libelle}</p>
+                              {tx.tiers_nom&&<p className="text-[10px] text-blue-600">👤 {tx.tiers_nom}</p>}
                               {tx.alerte&&<p className="text-[10px] text-orange-600">⚠️ {tx.alerte}</p>}
                             </TableCell>
                             <TableCell onClick={e=>e.stopPropagation()}>
@@ -970,54 +1122,81 @@ function BanquePage() {
                                   {CATEGORIES.map(c=><SelectItem key={c.value} value={c.value} className="text-xs">{c.label}</SelectItem>)}
                                 </SelectContent>
                               </Select>
+                              <p className="text-[10px] text-muted-foreground font-mono mt-0.5">{tx.compte_comptable} · {etapeLabel[tx.etape_rapprochement]??tx.etape_rapprochement}</p>
                             </TableCell>
-                            <TableCell className="font-mono text-xs">{tx.compte_comptable}</TableCell>
                             <TableCell className={`text-right font-mono text-sm font-semibold ${tx.type==="credit"?"text-green-600":"text-red-600"}`}>
                               {tx.type==="credit"?"+":"-"}{fmt(tx.montant)}
                             </TableCell>
-                            <TableCell>
-                              {tx.facture_id
-                                ?<Badge className="bg-green-100 text-green-700 text-xs">🔗 {tx.reference_facture||"Facture"}</Badge>
-                                :tx.alerte
-                                ?<Badge className="bg-orange-100 text-orange-700 text-xs">⚠️ Vérifier</Badge>
-                                :<Badge variant="secondary" className="text-xs">Auto</Badge>}
+                            <TableCell onClick={e=>e.stopPropagation()} className="min-w-[200px]">
+                              <Select
+                                value={tx.facture_id??"none"}
+                                onValueChange={v=>updateTxExtrait(idx,{facture_id:v==="none"?null:v})}>
+                                <SelectTrigger className={`h-7 text-xs ${tx.facture_id?"border-green-400 bg-green-50":"border-orange-300 bg-orange-50"}`}>
+                                  <div className="flex items-center gap-1 overflow-hidden">
+                                    {tx.facture_id
+                                      ?<><span className="text-green-600">🔗</span><span className="truncate text-green-700">{tx.reference_facture||"Facture matchée"}</span></>
+                                      :<><span className="text-orange-500">⚠️</span><span className="truncate text-orange-600">Aucune facture — choisir</span></>
+                                    }
+                                  </div>
+                                </SelectTrigger>
+                                <SelectContent>
+                                  <SelectItem value="none" className="text-xs text-muted-foreground">Aucune facture liée</SelectItem>
+                                  {facOptions.map(f=>(
+                                    <SelectItem key={f.id} value={f.id} className="text-xs">{f.label}</SelectItem>
+                                  ))}
+                                </SelectContent>
+                              </Select>
+                              {tx.facture_id&&<p className="text-[10px] text-green-600 mt-0.5">Confiance: {tx.confiance}%</p>}
+                            </TableCell>
+                            <TableCell onClick={e=>e.stopPropagation()}>
+                              {tx.facture_id&&facChoisie&&(
+                                <Button size="sm" variant="ghost" className="h-6 w-6 p-0"
+                                  onClick={()=>window.open((facChoisie as any).fichier_original_url??"#","_blank")}
+                                  title="Voir la facture">
+                                  <Eye className="h-3 w-3"/>
+                                </Button>
+                              )}
                             </TableCell>
                           </TableRow>
                           {selectedTx===idx&&(
                             <TableRow key={`${idx}-detail`}>
                               <TableCell colSpan={7} className="bg-muted/30 p-3">
-                                <div className="grid grid-cols-3 gap-3">
-                                  <div><p className="text-xs text-muted-foreground mb-1">Référence</p><p className="text-xs font-mono">{tx.reference||"—"}</p></div>
-                                  <div><p className="text-xs text-muted-foreground mb-1">Date valeur</p><p className="text-xs font-mono">{tx.date_valeur}</p></div>
-                                  <div><p className="text-xs text-muted-foreground mb-1">Confiance IA</p><p className={`text-xs font-semibold ${confColor(tx.confiance)}`}>{tx.confiance}%</p></div>
-                                  {tx.facture_id&&<div className="col-span-3"><p className="text-xs text-green-700">✅ Facture matchée ID: {tx.facture_id.slice(0,8)}… — {tx.reference_facture}</p></div>}
+                                <div className="grid grid-cols-4 gap-3 text-xs">
+                                  <div><p className="text-muted-foreground mb-1">Référence</p><p className="font-mono">{tx.reference||"—"}</p></div>
+                                  <div><p className="text-muted-foreground mb-1">Date valeur</p><p className="font-mono">{tx.date_valeur}</p></div>
+                                  <div><p className="text-muted-foreground mb-1">Confiance IA</p><p className={`font-semibold ${confColor(tx.confiance)}`}>{tx.confiance}%</p></div>
+                                  <div><p className="text-muted-foreground mb-1">Méthode match</p><p>{etapeLabel[tx.etape_rapprochement]??tx.etape_rapprochement}</p></div>
+                                  {tx.facture_id&&<div className="col-span-4"><p className="text-green-700">✅ Facture: {tx.reference_facture} — {tx.tiers_nom}</p></div>}
+                                  {!tx.facture_id&&<div className="col-span-4"><p className="text-orange-600">⚠️ {tx.alerte||"Aucune facture correspondante détectée — choisissez dans la liste déroulante"}</p></div>}
                                 </div>
                               </TableCell>
                             </TableRow>
                           )}
                         </>
-                      ))}
+                        );
+                      })}
                     </TableBody>
                   </Table>
                 </div>
               </CardContent></Card>
             </div>
           )}
- 
+
           {scanStep==="done"&&(
             <div className="text-center py-16">
               <CheckCircle className="h-16 w-16 text-green-500 mx-auto mb-4"/>
               <h2 className="text-xl font-bold mb-2">Relevé enregistré avec succès</h2>
               <p className="text-muted-foreground mb-6">{txExtraites.length} transactions · Écritures PCM créées · Factures mises à jour</p>
               <div className="flex gap-3 justify-center">
-                <Button variant="outline" onClick={genererBilan}><Download className="h-4 w-4 mr-2"/>Bilan Sage</Button>
+                <Button variant="outline" onClick={genererEDI}><Download className="h-4 w-4 mr-2"/>EDI DGI</Button>
+              <Button variant="outline" onClick={genererBilan}><Download className="h-4 w-4 mr-2"/>Bilan Sage</Button>
                 <Button onClick={()=>{resetScan();setTab("comptes");}}>Voir les transactions</Button>
                 <Button variant="outline" onClick={resetScan}>Nouveau relevé</Button>
               </div>
             </div>
           )}
         </TabsContent>
- 
+
         {/* ── ENCAISSEMENTS ── */}
         <TabsContent value="encaissements" className="mt-4">
           <div className="mb-4 p-4 bg-muted rounded-lg text-sm">
@@ -1027,7 +1206,7 @@ function BanquePage() {
           <Button onClick={()=>setOpenEncaissement(true)}><Plus className="h-4 w-4 mr-2"/>Saisir un encaissement</Button>
         </TabsContent>
       </Tabs>
- 
+
       {/* Modal rescanner */}
       <Dialog open={showRemarques} onOpenChange={setShowRemarques}>
         <DialogContent className="max-w-md">
@@ -1046,7 +1225,7 @@ function BanquePage() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
- 
+
       {/* Modal encaissement (code original) */}
       <Dialog open={openEncaissement} onOpenChange={setOpenEncaissement}>
         <DialogContent className="max-w-lg">
@@ -1094,7 +1273,7 @@ function BanquePage() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
- 
+
       {/* Modal compte (code original) */}
       <Dialog open={openCompte} onOpenChange={setOpenCompte}>
         <DialogContent>
@@ -1121,6 +1300,11 @@ function BanquePage() {
     </div>
   );
 }
+
+
+
+
+
 
 
 
