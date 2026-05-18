@@ -371,46 +371,49 @@ function parserRelevePDF(text: string): { txs: any[]; info: InfoReleve } {
 }
 
 // PCM mapping pour catégories
+// PCM_MAP selon CGI Art.106 — TVA déductible ou non au Maroc
 const PCM_MAP:Record<string,{code:string;tva:number}>={
-  encaissement_client:{code:"3421",tva:0},
-  paiement_fournisseur:{code:"4411",tva:20},
-  salaires:{code:"6171",tva:0},
-  cnss_amo:{code:"6174",tva:0},
-  tva_dgi:{code:"4456",tva:0},
-  loyers:{code:"6131",tva:20},
-  eau_electricite:{code:"6125",tva:7},
-  telecom:{code:"6132",tva:20},
-  gasoil:{code:"6122",tva:20},
-  assurance:{code:"6161",tva:0},
-  entretien:{code:"6141",tva:20},
-  frais_bancaires:{code:"6347",tva:10},
-  frais_representation:{code:"6147",tva:0},
-  frais_douane:{code:"6146",tva:0},
-  retrait_especes:{code:"5161",tva:0},
-  interets_crediteurs:{code:"7611",tva:0},
-  transport:{code:"6145",tva:0},
-  autre:{code:"6141",tva:0},
+  encaissement_client:  {code:"3421",  tva:0},   // Encaissement → pas de TVA
+  paiement_fournisseur: {code:"4411",  tva:20},  // Achats fournisseur → TVA 20% déductible
+  salaires:             {code:"6171",  tva:0},   // Salaires → hors champ TVA
+  cnss_amo:             {code:"6174",  tva:0},   // CNSS/AMO → hors champ TVA (CGI Art.106)
+  tva_dgi:              {code:"4456",  tva:0},   // Impôts → pas de TVA sur TVA
+  loyers:               {code:"6131",  tva:0},   // Local nu = exonéré; local meublé → modifier manuellement
+  eau_electricite:      {code:"6125",  tva:14},  // Électricité 14%, eau 7% → déductible
+  telecom:              {code:"6132",  tva:20},  // IAM/Inwi/Orange → TVA 20% déductible
+  gasoil:               {code:"61241", tva:0},   // Gasoil véhicules → NON déductible (CGI Art.106)
+  assurance:            {code:"6161",  tva:0},   // Assurance → exonérée TVA
+  entretien:            {code:"6141",  tva:20},  // Réparations → TVA 20% déductible
+  frais_bancaires:      {code:"6347",  tva:10},  // Commissions bancaires → TVA 10% déductible
+  taxe_professionnelle: {code:"6313",  tva:0},   // Taxes → pas de TVA
+  retrait_especes:      {code:"5161",  tva:0},   // Retrait → pas de TVA
+  interets_crediteurs:  {code:"7611",  tva:0},   // Intérêts → hors champ TVA
+  frais_representation: {code:"6147",  tva:0},   // Restaurant/réception → NON déductible (CGI Art.106)
+  frais_douane:         {code:"6146",  tva:0},   // Droits douane → pas de TVA récupérable
+  transport:            {code:"6145",  tva:14},  // Transport marchandises → TVA 14% déductible
+  autre:                {code:"6141",  tva:0},   // Divers → par défaut sans TVA
 };
 
 const CATEGORIES=[
-  {value:"encaissement_client",label:"Encaissement client"},
-  {value:"paiement_fournisseur",label:"Paiement fournisseur"},
-  {value:"salaires",label:"Salaires"},
-  {value:"cnss_amo",label:"CNSS / AMO"},
-  {value:"tva_dgi",label:"TVA / Impôts DGI"},
-  {value:"loyers",label:"Loyer / Location"},
-  {value:"eau_electricite",label:"Eau / Électricité"},
-  {value:"telecom",label:"Téléphone / Internet"},
-  {value:"gasoil",label:"Gasoil / Carburant"},
-  {value:"assurance",label:"Assurance"},
-  {value:"entretien",label:"Entretien / Réparation"},
-  {value:"frais_bancaires",label:"Frais bancaires"},
-  {value:"frais_representation",label:"Frais de représentation"},
-  {value:"frais_douane",label:"Frais douane / import"},
-  {value:"retrait_especes",label:"Retrait espèces"},
-  {value:"interets_crediteurs",label:"Intérêts créditeurs"},
-  {value:"transport",label:"Transport / Déplacement"},
-  {value:"autre",label:"Autre"},
+  {value:"encaissement_client",   label:"Encaissement client"},
+  {value:"paiement_fournisseur",  label:"Paiement fournisseur (avec facture)"},
+  {value:"salaires",              label:"Salaires"},
+  {value:"cnss_amo",              label:"CNSS / AMO (hors TVA)"},
+  {value:"tva_dgi",               label:"TVA / IR / IS / DGI"},
+  {value:"loyers",                label:"Loyer / Location (local nu → TVA 0%)"},
+  {value:"eau_electricite",       label:"Eau / Électricité (TVA déductible)"},
+  {value:"telecom",               label:"Téléphone / Internet (TVA 20%)"},
+  {value:"gasoil",                label:"Gasoil / Carburant (TVA non déduc.)"},
+  {value:"assurance",             label:"Assurance (exonérée TVA)"},
+  {value:"entretien",             label:"Entretien / Réparation (TVA 20%)"},
+  {value:"frais_bancaires",       label:"Frais bancaires (TVA 10%)"},
+  {value:"taxe_professionnelle",  label:"Taxe professionnelle"},
+  {value:"retrait_especes",       label:"Retrait espèces / GAB"},
+  {value:"interets_crediteurs",   label:"Intérêts créditeurs"},
+  {value:"frais_representation",  label:"Restaurant / Réception (TVA non déduc.)"},
+  {value:"frais_douane",          label:"Droits de douane / Import"},
+  {value:"transport",             label:"Transport marchandises (TVA 14%)"},
+  {value:"autre",                 label:"Autre opération"},
 ];
 
 // ─── Composant ────────────────────────────────────────────────────────────────
@@ -458,9 +461,9 @@ function BanquePage() {
 
   const load = async () => {
     const [{data:c},{data:r},{data:fc},{data:ff},{data:fo},{data:cl},{data:dos}]=await Promise.all([
-      supabase.from("comptes_bancaires").select("*").eq("dossier_id",dossierId).order("created_at"),
+      (supabase.from("comptes_bancaires") as any).select("*").eq("dossier_id",dossierId).order("created_at"),
       (supabase.from("releves_bancaires") as any).select("*").eq("dossier_id",dossierId).order("created_at",{ascending:false}),
-      supabase.from("factures").select("id,numero,montant_ttc,montant_ht,montant_tva,date_facture,date_echeance,clients(id,nom,ice)").eq("dossier_id",dossierId).eq("statut","conforme").neq("statut_paiement","payee"),
+      supabase.from("factures").select("id,numero,montant_ttc,montant_ht,montant_tva,montant_paye,montant_restant,type_facture,date_facture,date_echeance,clients(id,nom,ice)").eq("dossier_id",dossierId).eq("statut","conforme").neq("statut_paiement","payee"),
       (supabase as any).from("factures_fournisseurs").select("id,numero,montant_ttc,montant_ht,montant_tva,date_facture,date_echeance,fournisseur_nom").eq("dossier_id",dossierId).neq("statut_paiement","payee"),
       (supabase as any).from("fournisseurs").select("id,nom,ice").eq("dossier_id",dossierId),
       supabase.from("clients").select("id,nom,ice").eq("dossier_id",dossierId),
@@ -480,7 +483,7 @@ function BanquePage() {
   };
 
   const loadTx=async(cid:string)=>{
-    const{data}=await supabase.from("transactions_bancaires").select("*").eq("compte_id",cid).order("date_operation",{ascending:false}).limit(100);
+    const{data}=await (supabase.from("transactions_bancaires") as any).select("*").eq("compte_id",cid).order("date_operation",{ascending:false}).limit(100);
     setTransactions((data??[]) as TxBancaire[]);
   };
 
@@ -610,7 +613,7 @@ function BanquePage() {
         tx.solde_apres=soldeCourant;
       }
 
-      await supabase.from("transactions_bancaires").insert(txToInsert);
+      await (supabase.from("transactions_bancaires") as any).insert(txToInsert);
       await (supabase.from("comptes_bancaires") as any).update({solde_actuel:soldeCourant}).eq("id",releveCompteId);
 
       // ── Écritures comptables PCM correctes ────────────────────────────────

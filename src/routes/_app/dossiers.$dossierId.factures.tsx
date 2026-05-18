@@ -308,8 +308,21 @@ function FacturesPage() {
 
   // KPIs
   const conformes  = factures.filter(f=>f.statut==="conforme");
+  // CA HT = montant HT facturé (factures DGI conformes)
   const caHT       = conformes.reduce((s,f)=>s+Number(f.montant_ht),0);
-  const encours    = conformes.filter(f=>f.statut_paiement!=="payee").reduce((s,f)=>s+Number(f.montant_restant||f.montant_ttc),0);
+  // CA encaissé = ce qui a réellement été reçu
+  const caEncaisse = conformes.reduce((s,f)=>{
+    const paye = Number(f.montant_paye??0);
+    const ttc  = Number(f.montant_ttc)||1;
+    const ht   = Number(f.montant_ht);
+    return s + (paye > 0 ? Math.round(paye * ht/ttc * 100)/100 : 0);
+  }, 0);
+  // Encours = somme des montants restants à encaisser
+  const encours    = conformes.reduce((s,f)=>{
+    if(f.statut_paiement==="payee") return s;
+    const restant = Number(f.montant_restant??f.montant_ttc);
+    return s + restant;
+  }, 0);
   const enAnalyse  = factures.filter(f=>f.statut==="envoyee"||f.statut_dgi==="en_analyse").length;
 
   return (
@@ -479,9 +492,10 @@ function FacturesPage() {
       </div>
 
       {/* KPIs */}
-      <div className="grid grid-cols-4 gap-4 mb-6">
+      <div className="grid grid-cols-5 gap-4 mb-6">
         {[
-          {label:"CA HT (conformes DGI)",value:fmt(caHT),color:"text-green-600"},
+          {label:"CA HT facturé",value:fmt(caHT),color:"text-green-600"},
+          {label:"CA HT encaissé",value:fmt(caEncaisse),color:"text-emerald-600"},
           {label:"Encours clients",value:fmt(encours),color:"text-blue-600"},
           {label:"En analyse DGI",value:String(enAnalyse),color:"text-yellow-600"},
           {label:"Conformes",value:String(conformes.length),color:"text-green-600"},
@@ -620,6 +634,3 @@ function FacturesPage() {
     </div>
   );
 }
-
-
-
